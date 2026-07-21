@@ -452,6 +452,7 @@ Object NetComConnection, NetComConnectionID, Primer
   DefineVariable  dRcvQueuedIOJobs,   DWORD,            0     ;Number of posted Recv operations (0/1)
 
   ;Management
+  DefineVariable  pTLSContext,        POINTER,          NULL  ;-> TLS_Context or NULL
   DefineVariable  pData,              POINTER,          NULL  ;-> Data managed by the protocol
   DefineVariable  CritSect,           CRITICAL_SECTION, {}
   DefineVariable  wName,              CHRW,             28 dup(?) ;Used for DebugCenter Wnd Caption
@@ -510,6 +511,8 @@ Object NetComProtocol, NetComProtocolID, Primer
   VirtualMethod   OnConnected,        $ObjPtr(NetComConnection)
   VirtualMethod   OnDisconnected,     $ObjPtr(NetComConnection), DWORD, DWORD
   VirtualMethod   OnError,            $ObjPtr(NetComConnection), PIOJOB, DWORD
+  VirtualMethod   OnHandshakeComplete,$ObjPtr(NetComConnection)
+  VirtualMethod   OnHandshakeFailed,  $ObjPtr(NetComConnection), DWORD  ;dErrorCode
   VirtualMethod   OnTimeouted,        $ObjPtr(NetComConnection)
   VirtualMethod   ProcessData,        $ObjPtr(NetComConnection), DWORD ;-> NetComConnection, Index
   VirtualMethod   Release,            $ObjPtr(NetComConnection)

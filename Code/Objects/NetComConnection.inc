@@ -33,6 +33,14 @@ Method NetComConnection.Admit, uses xsi, dDecision:DWORD
     invoke CreateIoCompletionPort, [xsi].hSocket, [xax].$Obj(NetComEngine).hIOCP, xsi, 0
     .if eax != 0
       invoke GetSystemTimeAsFileTime, addr [xsi].StartTime
+
+      ;TLS: If pTLSContext is set, start server handshake (sets TLS_STATE_HANDSHAKE)
+      ;This must happen BEFORE QueueReceive, so that when the first client handshake
+      ;token arrives, the state machine in OnReceived routes it to ProcessHandshakeData.
+      .if [xsi].pTLSContext != NULL
+        OCall [xsi].pTLSContext::TLS_Context.StartServerHandshake, xsi
+      .endif
+
       OCall xsi.QueueReceive
     .else
       invoke WSAGetLastError
@@ -349,7 +357,7 @@ MethodEnd
 ; Arguments:  Arg1: -> IOJob.
 ; Return:     Nothing.
 
-Method NetComConnection.OnConnected, uses  xsi, pIOJob:PIOJOB
+Method NetComConnection.OnConnected, uses xsi, pIOJob:PIOJOB
   local dSize:DWORD
 
   SetObject xsi
@@ -368,7 +376,20 @@ Method NetComConnection.OnConnected, uses  xsi, pIOJob:PIOJOB
 ;  DbgCheckSockReturn "NetComConnection.OnConnected - getsockname",, addr [xsi].wName
 ;  DbgNetComAddrIPV4 [xsi].LocalAddr, "NetComConnection.OnConnected - LocalAddr", addr [xsi].wName
 ;  DbgNetComAddrIPV4 [xsi].RemoteAddr, "NetComConnection.OnConnected - RemoteAddr", addr [xsi].wName
-  OCall [xsi].pProtocol::NetComProtocol.OnConnected, xsi
+
+  .if [xsi].pTLSContext != NULL
+    ; (1) Socket empfangsbereit machen BEVOR Handshake startet
+    OCall xsi.QueueReceive
+
+    ; (2) TLS-Handshake initiieren
+    OCall [xsi].pTLSContext::TLS_Context.StartClientHandshake, xsi
+
+    ; (3) Anwendung informieren
+    OCall [xsi].pProtocol::NetComProtocol.OnConnected, xsi
+  .else
+    ; Kein TLS — normaler Ablauf
+    OCall [xsi].pProtocol::NetComProtocol.OnConnected, xsi
+  .endif
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -444,6 +465,11 @@ MethodEnd
 
 Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
   local dConsumed:DWORD
+  local pPlaintext:POINTER
+  local dPlaintextSize:DWORD
+  local dTLSState:DWORD
+  local pTLSData:POINTER
+  local dTLSDataSize:DWORD
 
   SetObject xsi
   lock dec [xsi].dRcvQueuedIOJobs
@@ -478,6 +504,115 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
 ;                       addr [xsi].dRcvLstElpsdTime, addr dRcvLstElpsdTimeSize
 ;    DbgCheckSockReturn "ERROR on OnReceived getsockopt SO_CONNECT_TIME",, addr [xsi].wName
 
+    ; === TLS State-Machine ===
+    .if [xsi].pTLSContext != NULL
+      invoke EnterCriticalSection, addr [xsi].CritSect
+      OCall [xsi].pTLSContext::TLS_Context.GetState
+      mov dTLSState, eax
+
+      .if eax == TLS_STATE_HANDSHAKE || eax == TLS_STATE_SHUTDOWN
+        ; Pass IOJob data to ProcessHandshakeData for handshake/shutdown processing
+        mov xdx, pIOJob
+        mov xax, [xdx].IOJOB.WSABuf.buf
+        mov pTLSData, xax
+        mov eax, [xdx].IOJOB.dBytesConsumed
+        mov dTLSDataSize, eax
+        OCall [xsi].pTLSContext::TLS_Context.ProcessHandshakeData, pTLSData, dTLSDataSize, xsi
+        ; Remove IOJob from RcvIOJobChain and return to pool (data consumed by TLS context)
+        mov xcx, pIOJob
+        lea xax, [xcx].IOJOB.pNextItem
+        SDLL_Remove xax, xcx, xdx
+        mov xcx, [xsi].pOwner
+        OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
+        jmp @@TLSDone
+
+      .elseif eax == TLS_STATE_DATA
+        ; Decrypt the received data
+        mov xdx, pIOJob
+        mov xax, [xdx].IOJOB.WSABuf.buf
+        mov pTLSData, xax
+        mov eax, [xdx].IOJOB.dBytesConsumed
+        mov dTLSDataSize, eax
+        OCall [xsi].pTLSContext::TLS_Context.Decrypt, \
+              pTLSData, dTLSDataSize, addr pPlaintext, addr dPlaintextSize
+        mov xdi, xax                                    ;Save Decrypt return value
+
+        ; Check for Decrypt error
+        .if xdi != OBJ_OK
+          ; Fatal decrypt error - remove IOJob and notify protocol
+          mov xcx, pIOJob
+          lea xax, [xcx].IOJOB.pNextItem
+          SDLL_Remove xax, xcx, xdx
+          mov xcx, [xsi].pOwner
+          OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
+          OCall [xsi].pProtocol::NetComProtocol.OnError, xsi, NULL, TLS_DECRYPT_ERROR
+          jmp @@TLSDone
+        .endif
+
+        ; Check if we got plaintext data (0 bytes means incomplete TLS record, wait for more)
+        .if dPlaintextSize != 0 && pPlaintext != NULL
+          ; Reuse the existing IOJob: copy plaintext back into its buffer and adjust size
+          mov xbx, pIOJob
+          mov xdx, [xbx].IOJOB.WSABuf.buf
+          invoke MemClone, xdx, pPlaintext, dPlaintextSize
+          m2m [xbx].IOJOB.dBytesConsumed, dPlaintextSize, edx
+
+          ; Call IsDataComplete? and ProcessData on the plaintext
+          OCall [xsi].pProtocol::NetComProtocol.IsDataComplete?, xsi, xbx
+          .if eax == ERROR_BAD_PROTOCOL || eax == ERROR_USER_QUIT
+            OCall xsi.Disconnect, SD_BOTH
+            OCall xsi.QueueDestroy
+            OCall xsi.Close, TRUE
+          .elseif eax != 0
+            OCall [xsi].pProtocol::NetComProtocol.ProcessData, xsi, eax
+            .if eax != 0                              ;eax = # of BYTEs consumed
+              mov dConsumed, eax
+              lea xdi, [xsi].RcvIOJobChain
+              mov xbx, [xdi].SDLL_SENTINEL.pFirstItem
+              .while xbx != xdi && dConsumed != 0
+                mov edx, [xbx - IOJOB_HEADER_SIZE].IOJOB.dBytesConsumed
+                .if edx <= dConsumed
+                  sub dConsumed, edx
+                  mov xcx, [xsi].pOwner
+                  lea xdx, [xbx - IOJOB_HEADER_SIZE]
+                  mov xbx, [xbx].SDLL_ITEM.pNextItem
+                  OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, xdx
+                  .break .if dConsumed == 0
+                .else
+                  mov ecx, dConsumed
+                  add [xbx - IOJOB_HEADER_SIZE].IOJOB.WSABuf.buf, xcx
+                  sub [xbx - IOJOB_HEADER_SIZE].IOJOB.dBytesConsumed, ecx
+                  .break
+                .endif
+              .endw
+              mov [xdi].SDLL_SENTINEL.pFirstItem, xbx
+              mov [xbx].SDLL_ITEM.pPrevItem, xdi
+            .endif
+          .endif
+        .else
+          ; No plaintext yet (incomplete TLS record) - mark IOJob as empty
+          mov xbx, pIOJob
+          mov [xbx].IOJOB.dBytesConsumed, 0
+        .endif
+        jmp @@TLSDone
+
+      .elseif eax == TLS_STATE_ERROR
+        ; Error state - no processing, notify protocol and free the IOJob
+        mov xcx, pIOJob
+        lea xax, [xcx].IOJOB.pNextItem
+        SDLL_Remove xax, xcx, xdx
+        mov xcx, [xsi].pOwner
+        OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
+        OCall [xsi].pProtocol::NetComProtocol.OnError, xsi, NULL, TLS_DECRYPT_ERROR
+        jmp @@TLSDone
+
+      .endif
+      ; TLS_STATE_NONE: Fall through to normal processing below
+      invoke LeaveCriticalSection, addr [xsi].CritSect
+    .endif
+    ; === End TLS State-Machine ===
+
+    mov xbx, [xsi].pOwner                              ;Restore xbx for non-TLS path
     OCall [xsi].pProtocol::NetComProtocol.IsDataComplete?, xsi, pIOJob
     .if eax == ERROR_BAD_PROTOCOL || eax == ERROR_USER_QUIT
       OCall xsi.Disconnect, SD_BOTH
@@ -519,6 +654,8 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
       .endif
       xor eax, eax
     .endif
+@@TLSDone:
+      invoke LeaveCriticalSection, addr [xsi].CritSect
   .endif
 MethodEnd
 
@@ -712,13 +849,124 @@ MethodEnd
 ;             Arg2: Data size in BYTEs.
 ; Return:     eax = Number of queued BYTEs.
 
-Method NetComConnection.QueueSend, uses xdi xsi, pData:POINTER, dSize:DWORD
+Method NetComConnection.QueueSend, uses xbx xdi xsi, pData:POINTER, dSize:DWORD
   local dBufferSize:DWORD, pItem:PIOJOB
+  local pEncrypted:POINTER, dEncryptedSize:DWORD
+  local dBlockSize:DWORD, dPlainBlockSize:DWORD
+  local pEncData:POINTER, dEncDataRemaining:DWORD
 
   SetObject xsi
 ;  DbgText "NetComConnection.QueueSend", addr [xsi].wName
   mov edi, dSize
 
+  ; === TLS Check ===
+  .if [xsi].pTLSContext != NULL
+    OCall [xsi].pTLSContext::TLS_Context.GetState
+
+    .if eax == TLS_STATE_DATA
+      ; === TLS_STATE_DATA: Encrypt before sending ===
+
+      ; Backpressure check BEFORE encryption (Requirement 7.9)
+      .ifBitSet [xsi].dFlags, NCC_SND_PAUSED
+        xor eax, eax                                    ;Return 0 bytes sent
+        jmp @@Exit
+      .endif
+
+      ; Get cbMaximumMessage for block fragmentation
+      mov xbx, [xsi].pTLSContext
+      mov eax, [xbx].$Obj(TLS_SChannelContext).StreamSizes.cbMaximumMessage
+      mov dBlockSize, eax
+
+      ; Get IOJob buffer size for sending encrypted blocks
+      mov xcx, [xsi].pOwner                             ;xcx -> NetComConnectionPool
+      mov xdx, [xcx].$Obj(NetComConnectionPool).pIOJobPool ;xdx -> NetComIOJobPool
+      m2m dBufferSize, [xdx].$Obj(NetComIOJobPool).dBufferSize, eax
+
+      ; Fragment plaintext into blocks <= cbMaximumMessage, encrypt each, send encrypted
+      .while edi != 0
+        ; Determine this block's plaintext size (min of remaining and cbMaximumMessage)
+        mov eax, edi
+        .if eax > dBlockSize
+          mov eax, dBlockSize
+        .endif
+        mov dPlainBlockSize, eax
+
+        ; Encrypt this block via TLS_Context.Encrypt
+        OCall [xsi].pTLSContext::TLS_Context.Encrypt, pData, dPlainBlockSize, \
+              addr pEncrypted, addr dEncryptedSize
+        .if eax != OBJ_OK
+          ; Encryption error - report and stop
+          OCall [xsi].pProtocol::NetComProtocol.OnError, xsi, NULL, TLS_ENCRYPT_ERROR
+          .break
+        .endif
+
+        ; Send the encrypted block using existing IOJob fragmentation logic.
+        m2m pEncData, pEncrypted, xax
+        m2m dEncDataRemaining, dEncryptedSize, eax
+
+        .while dEncDataRemaining != 0
+          mov xcx, [xsi].pOwner                         ;xcx -> NetComConnectionPool
+          OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.NewItem, IOJOB_SEND
+          .if xax != NULL
+            mov pItem, xax
+            mov edx, dEncDataRemaining
+            .if dBufferSize < edx
+              ;Send a full IOJob buffer and cycle again
+              m2m [xax].IOJOB.WSABuf.len, dBufferSize, edx
+              invoke MemClone, [xax].IOJOB.WSABuf.buf, pEncData, dBufferSize
+              OCall xsi.DoSndIOJob, pItem
+              .if eax != NO_ERROR
+                sub edi, dPlainBlockSize
+                jmp @@TLSDataDone
+              .endif
+              mov edx, dBufferSize
+              sub dEncDataRemaining, edx
+              add pEncData, xdx
+            .else
+              ;Send the remaining encrypted data
+              m2m [xax].IOJOB.WSABuf.len, dEncDataRemaining, edx
+              invoke MemClone, [xax].IOJOB.WSABuf.buf, pEncData, dEncDataRemaining
+              OCall xsi.DoSndIOJob, pItem
+              .if eax != NO_ERROR
+                sub edi, dPlainBlockSize
+                jmp @@TLSDataDone
+              .endif
+              mov dEncDataRemaining, 0
+            .endif
+          .else
+            OCall xsi.ErrorReport, NULL, NCCN_OUT_OF_MEMORY
+            sub edi, dPlainBlockSize
+            jmp @@TLSDataDone
+          .endif
+        .endw
+
+        ; Encrypted block sent successfully - advance plaintext pointer
+        mov eax, dPlainBlockSize
+        sub edi, eax
+        add pData, xax
+      .endw
+
+    @@TLSDataDone:
+      mov eax, dSize
+      sub eax, edi
+      jmp @@Exit
+
+    .elseif eax == TLS_STATE_HANDSHAKE
+      ; === TLS_STATE_HANDSHAKE: Token data goes directly without encryption ===
+      ; Fall through to the existing send logic below (tokens are already SSPI-formatted)
+
+    .elseif eax == TLS_STATE_SHUTDOWN || eax == TLS_STATE_ERROR
+      ; === TLS_STATE_SHUTDOWN / TLS_STATE_ERROR: Do not send ===
+      xor eax, eax
+      jmp @@Exit
+
+    .else
+      ; TLS_STATE_NONE with pTLSContext set: fall through to direct send
+    .endif
+  .endif
+  ; === End TLS Check ===
+
+  ; --- Existing send logic (non-TLS, or HANDSHAKE token pass-through) ---
   mov xcx, [xsi].pOwner                                 ;xcx -> NetComConnectionPool
   mov xdx, [xcx].$Obj(NetComConnectionPool).pIOJobPool  ;xdx -> NetComIOJobPool
   m2m dBufferSize, [xdx].$Obj(NetComIOJobPool).dBufferSize, eax
@@ -758,6 +1006,8 @@ Method NetComConnection.QueueSend, uses xdi xsi, pData:POINTER, dSize:DWORD
   .endw
   mov eax, dSize
   sub eax, edi
+
+@@Exit:
 MethodEnd
 
 endif

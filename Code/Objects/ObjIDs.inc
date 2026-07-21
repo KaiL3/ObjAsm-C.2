@@ -431,6 +431,14 @@ NetComProtocolID                  equ     0000012106
 NetComSupervisorID                equ     0000012107
 NetComFileID                      equ     0000012108
 NetComFileEventsID                equ     0000012109
+TLS_ContextID                     equ     0000012110
+TLS_SChannelContextID             equ     0000012111
+TLS_CertValidatorID               equ     0000012112
+TLS_ClientCertProviderID          equ     0000012113
+TLS_ServerCertProviderID          equ     0000012114
+TLS_DefaultCertValidatorID        equ     0000012115
+TLS_DefaultClientCertProviderID   equ     0000012116
+TLS_DefaultServerCertProviderID   equ     0000012117
 
 ;ACE
 AsmDevEnvID                       equ     0000012200

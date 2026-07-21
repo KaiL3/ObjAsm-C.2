@@ -118,10 +118,6 @@ Chart
 ChartXY
 ChartBar
 
-D3Engine
-
-Database
-
 ElasticSkin
 SkinnedDialogAbout
 SkinnedMsgBox
@@ -134,3 +130,12 @@ XTreeView
 EnumVARIANT
 IAT_Hook
 WebTextTranslator
+
+TLS_CertValidator
+TLS_ClientCertProvider
+TLS_ServerCertProvider
+TLS_Context
+TLS_DefaultCertValidator
+TLS_DefaultClientCertProvider
+TLS_DefaultServerCertProvider
+TLS_SChannelContext

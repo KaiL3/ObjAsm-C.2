@@ -231,6 +231,33 @@ Method NetComProtocol.OnTimeouted,, pConnection:$ObjPtr(NetComConnection)
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
+; Method:     NetComProtocol.OnHandshakeComplete
+; Purpose:    TLS handshake completed successfully. Override in derived classes to handle the event.
+; Arguments:  Arg1: -> NetComConnection.
+; Return:     Nothing.
+
+Method NetComProtocol.OnHandshakeComplete,, pConnection:$ObjPtr(NetComConnection)
+  ANNOTATION use:pConnection
+  DbgSetWindowName
+
+;  DbgText "NetComProtocol.OnHandshakeComplete", pDbgWndNameW
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComProtocol.OnHandshakeFailed
+; Purpose:    TLS handshake failed. Override in derived classes to handle the event.
+; Arguments:  Arg1: -> NetComConnection.
+;             Arg2: Error code.
+; Return:     Nothing.
+
+Method NetComProtocol.OnHandshakeFailed,, pConnection:$ObjPtr(NetComConnection), dError:DWORD
+  ANNOTATION use:pConnection dError
+  DbgSetWindowName
+
+;  DbgText "NetComProtocol.OnHandshakeFailed", pDbgWndNameW
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
 ; Method:     NetComProtocol.ProcessData
 ; Purpose:    A client has finished sending us data, now we have to do something with that data.
 ; Arguments:  Arg1: -> NetComConnection.
