@@ -539,8 +539,13 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
 ;    DbgText "NetComConnection.OnReceived - FIN", addr [xsi].wName
     ;There is no other possibility to get a zero length payload => No need to pass it
     ;to any protocol handler
-    ;This IOJob remain in the RcvIOJobChain
     BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_REMOTE        ;Remote shutdown send
+
+    ;Remove FIN IOJob from RcvIOJobChain and return to pool (contains no useful data)
+    mov xcx, pIOJob
+    lea xax, [xcx].IOJOB.pNextItem
+    SDLL_Remove xax, xcx, xdx
+    OCall [xbx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
 
     ; === TLS Shutdown Pending: Peer hat TCP FIN statt close_notify geschickt ===
     .ifBitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
@@ -687,13 +692,19 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
             .endif
           .endif
         .else
-          ; No plaintext yet (incomplete TLS record) - mark IOJob as empty
+          ; No plaintext yet (incomplete TLS record)
           mov xbx, pIOJob
-          mov [xbx].IOJOB.dBytesConsumed, 0
 
           ; === Peer close_notify erkennen (SEC_I_CONTEXT_EXPIRED ? TLS_STATE_SHUTDOWN) ===
           OCall [xsi].pTLSContext::TLS_Context.GetState
           .if eax == TLS_STATE_SHUTDOWN
+            ; IOJob freigeben (enthält keine nutzbaren Daten mehr)
+            mov xcx, pIOJob
+            lea xax, [xcx].IOJOB.pNextItem
+            SDLL_Remove xax, xcx, xdx
+            mov xcx, [xsi].pOwner
+            OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
+
             ; Antwort mit eigenem close_notify (RFC 8446 §6.1)
             OCall [xsi].pTLSContext::TLS_Context.Shutdown, xsi
             ; TCP-Level Disconnect
@@ -709,6 +720,9 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
               invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
                      0, COMPLETION_KEY_DISCONNECTED, xsi
             .endif
+          .else
+            ; Wirklich incomplete TLS record - IOJob bleibt mit 0 Bytes in Chain
+            mov [xbx].IOJOB.dBytesConsumed, 0
           .endif
           ; === END ===
         .endif

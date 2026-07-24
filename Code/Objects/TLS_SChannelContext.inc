@@ -1502,6 +1502,14 @@ Method TLS_SChannelContext.Shutdown, uses xbx xdi xsi, pConnection:POINTER
 
   SetObject xsi
 
+  ; Guard: If state is already TLS_STATE_SHUTDOWN (set by DecryptMessage on
+  ; SEC_I_CONTEXT_EXPIRED when peer sent close_notify), skip ApplyControlToken.
+  ; The security context already knows it's shutting down — we only need to
+  ; generate our response token via ISC/ASC.
+  .if [xsi].dState == TLS_STATE_SHUTDOWN
+    jmp @@GenerateToken
+  .endif
+
   ; Set the shutdown token type
   mov ShutdownToken, SCHANNEL_SHUTDOWN
 
@@ -1528,6 +1536,8 @@ Method TLS_SChannelContext.Shutdown, uses xbx xdi xsi, pConnection:POINTER
     mov eax, TLS_HANDSHAKE_FAILED
     jmp @@Exit
   .endif
+
+@@GenerateToken:
 
   ; Now generate the shutdown token to send to the peer
   ; Re-use OutBuffer for the output

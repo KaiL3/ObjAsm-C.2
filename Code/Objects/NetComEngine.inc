@@ -574,6 +574,9 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
               xdi, [xdi].$Obj(NetComConnection).dDisconnectDirection, \
               [xdi].$Obj(NetComConnection).dDisconnectError
         mov xsi, pEngine                                 ;Restore Engine pointer
+        ;Restore xdi from pIOJob — Protocol callback may have clobbered xdi (rdi)
+        ;without 'uses xdi'. pIOJob holds the Connection pointer for synthetic keys.
+        mov xdi, pIOJob
         lock or [xdi].$Obj(NetComConnection).dFlags, NCC_DISCONNECTED_DELIVERED
         invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
       .else
@@ -589,6 +592,8 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
       .if eax != FALSE
         OCall [xdi].$Obj(NetComConnection).pProtocol::NetComProtocol.OnClosed, xdi
         mov xsi, pEngine                                 ;Restore Engine pointer
+        ;Restore xdi from pIOJob — same reason as above
+        mov xdi, pIOJob
         lock or [xdi].$Obj(NetComConnection).dFlags, NCC_CLOSED_DELIVERED
         invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
       .else
