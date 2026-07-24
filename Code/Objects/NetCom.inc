@@ -142,6 +142,12 @@ NCC_BIND                    equ   BIT10
 NCC_BOUND                   equ   BIT11
 NCC_DONE                    equ   BIT12
 
+;TLS Shutdown lifecycle
+NCC_TLS_SHUTDOWN_PENDING    equ   BIT13     ;TLS close_notify gesendet, warte auf Peer
+NCC_DISCONNECT_POSTED       equ   BIT14     ;COMPLETION_KEY_DISCONNECTED wurde an IOCP gepostet
+NCC_DISCONNECTED_DELIVERED  equ   BIT15     ;OnDisconnected wurde an Protocol geliefert
+NCC_CLOSED_DELIVERED        equ   BIT16     ;OnClosed wurde an Protocol geliefert
+
 ;Backpressure control
 NCC_RCV_PAUSED              equ   BIT24
 NCC_SND_PAUSED              equ   BIT25
@@ -264,6 +270,8 @@ endif
 COMPLETION_KEY_VOID           equ   -1      ;Used to purge the connection
 COMPLETION_KEY_KILL_WORKER    equ   -2
 COMPLETION_KEY_SOCK_ACCEPTED  equ   -3
+COMPLETION_KEY_DISCONNECTED   equ   -4      ;Async OnDisconnected via IOCP
+COMPLETION_KEY_CLOSED         equ   -5      ;Async OnClosed via IOCP
 
 AcceptEx proto WIN_STD_CALL_CONV :SOCKET,:SOCKET,:PVOID,:DWORD,:DWORD,:DWORD,:LPDWORD,:LPOVERLAPPED
 TYPE_CONNECTEX typedef proto :HANDLE, :POINTER, :DWORD, :POINTER, :DWORD, :POINTER, :LPOVERLAPPED
@@ -454,6 +462,8 @@ Object NetComConnection, NetComConnectionID, Primer
   ;Management
   DefineVariable  pTLSContext,        POINTER,          NULL  ;-> TLS_Context or NULL
   DefineVariable  pData,              POINTER,          NULL  ;-> Data managed by the protocol
+  DefineVariable  dDisconnectError,   DWORD,            0     ;Error-Code für async OnDisconnected
+  DefineVariable  dDisconnectDirection, DWORD,          0     ;Direction für async OnDisconnected (SD_xxx)
   DefineVariable  CritSect,           CRITICAL_SECTION, {}
   DefineVariable  wName,              CHRW,             28 dup(?) ;Used for DebugCenter Wnd Caption
 ObjectEnd
@@ -586,6 +596,9 @@ Object NetComSupervisor, NetComSupervisorID, Primer
 
   ;Connetion inactivity timeout = 0 means no timeout
   DefineVariable  dInactivityTimeout, DWORD,      10*10000000 ;10 seconds in 100ns units
+
+  ;TLS Shutdown timeout: max wait time for peer close_notify response
+  DefineVariable  dTLSShutdownTimeout, DWORD,     5*10000000  ;5 seconds in 100ns units
 ObjectEnd
 
 

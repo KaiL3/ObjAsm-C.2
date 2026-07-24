@@ -65,6 +65,21 @@ Method NetComConnection.Close, uses xsi, dAbortive:DWORD
   SetObject xsi
   .ifBitClr [xsi].dFlags, NCC_CLOSED
 ;    DbgText "NetComConnection.Close", addr [xsi].wName
+
+    ; TLS Shutdown Pending abbrechen
+    BitClr [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
+
+    ; OnDisconnected posten falls noch nicht geschehen
+    .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
+      BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
+      mov [xsi].dDisconnectError, NO_ERROR
+      mov [xsi].dDisconnectDirection, SD_BOTH            ;Close = beide Richtungen
+      mov xcx, [xsi].pOwner                             ;xcx -> NetComConnectionPool
+      mov xax, [xcx].$Obj(NetComConnectionPool).pOwner  ;xax -> NetComEngine
+      invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
+             0, COMPLETION_KEY_DISCONNECTED, xsi
+    .endif
+
     ;Perform a "graceful" or "abortive" disconnection of the socket sending a "FIN" or "RST"
     ;to the remote endpoint
     ?mov edx, dAbortive
@@ -75,7 +90,12 @@ Method NetComConnection.Close, uses xsi, dAbortive:DWORD
     BitSet [xsi].dFlags, NCC_CLOSED                    ;Set marker before closesocket!
     invoke closesocket, [xsi].hSocket
     mov [xsi].hSocket, INVALID_SOCKET
-    OCall [xsi].pProtocol::NetComProtocol.OnClosed, xsi
+
+    ; OnClosed asynchron posten (FIFO-Reihenfolge: nach DISCONNECTED)
+    mov xcx, [xsi].pOwner                             ;xcx -> NetComConnectionPool
+    mov xax, [xcx].$Obj(NetComConnectionPool).pOwner  ;xax -> NetComEngine
+    invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
+           0, COMPLETION_KEY_CLOSED, xsi
   .endif
 MethodEnd
 
@@ -93,6 +113,20 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
   mov dRetValue, NO_ERROR
   xor eax, eax
   .ifBitClr [xsi].dFlags, NCC_CLOSED
+
+    ; === TLS: Graceful close_notify ===
+    .if [xsi].pTLSContext != NULL && dDirection != SD_RECEIVE
+      OCall [xsi].pTLSContext::TLS_Context.GetState
+      .if eax == TLS_STATE_DATA
+        OCall [xsi].pTLSContext::TLS_Context.Shutdown, xsi
+        BitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
+        invoke GetSystemTimeAsFileTime, addr [xsi].LastTime
+        ; Kein TCP shutdown hier — warten auf Peer-Antwort oder Timeout
+        ExitMethod
+      .endif
+    .endif
+
+    ; === Kein TLS oder TLS nicht im DATA-State ===
     invoke shutdown, [xsi].hSocket, dDirection            ;Send FIN to the remote host
     .if eax == NO_ERROR
       .if dDirection == SD_RECEIVE
@@ -107,7 +141,17 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
       mov dRetValue, eax
 ;      DbgCheckSockReturn "NetComConnection.Disconnect - shutdown error", eax, addr [xsi].wName
     .endif
-    OCall [xsi].pProtocol::NetComProtocol.OnDisconnected, xsi, dDirection, dRetValue
+
+    ; === OnDisconnected asynchron posten (genau einmal) ===
+    .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
+      BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
+      m2m [xsi].dDisconnectError, dRetValue, eax
+      m2m [xsi].dDisconnectDirection, dDirection, eax
+      mov xcx, [xsi].pOwner                             ;xcx -> NetComConnectionPool
+      mov xax, [xcx].$Obj(NetComConnectionPool).pOwner  ;xax -> NetComEngine
+      invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
+             0, COMPLETION_KEY_DISCONNECTED, xsi
+    .endif
   .endif
   mov eax, dRetValue
 MethodEnd
@@ -406,6 +450,20 @@ Method NetComConnection.OnError, uses xbx xdi xsi, pIOJob:PIOJOB, dError:DWORD
   mov xbx, pIOJob
   mov xdi, [xsi].pOwner                                 ;xdi -> NetComConnectionPool
 
+  ; === Spurious Errors nach Close unterdrücken ===
+  .ifBitSet [xsi].dFlags, NCC_CLOSED
+    movzx eax, [xbx].IOJOB.wOperation
+    .if eax == IOJOB_RECV
+      ;IOJob aus RcvIOJobChain entfernen
+      mov xcx, pIOJob
+      lea xax, [xcx].IOJOB.pNextItem
+      SDLL_Remove xax, xcx, xdx
+    .endif
+    OCall [xdi].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, xbx
+    ExitMethod
+  .endif
+  ; === End Guard ===
+
   movzx eax, [xbx].IOJOB.wOperation
 ;  DbgDec eax, "NetComConnection.OnError Operation";, addr [xsi].wName
   .if eax == IOJOB_ACCEPT
@@ -483,19 +541,39 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
     ;to any protocol handler
     ;This IOJob remain in the RcvIOJobChain
     BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_REMOTE        ;Remote shutdown send
-    .ifBitClr [xsi].dFlags, NCC_CLOSED
-      OCall xsi.Disconnect, SD_RECEIVE                  ;Local shutdown receive
+
+    ; === TLS Shutdown Pending: Peer hat TCP FIN statt close_notify geschickt ===
+    .ifBitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
+      BitClr [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
+      BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
+      ; OnDisconnected posten (genau einmal)
+      .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
+        BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
+        mov [xsi].dDisconnectError, NO_ERROR
+        mov [xsi].dDisconnectDirection, SD_SEND          ;Wir haben initiiert
+        mov xcx, [xsi].pOwner                           ;xcx -> NetComConnectionPool
+        mov xax, [xcx].$Obj(NetComConnectionPool).pOwner ;xax -> NetComEngine
+        invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
+               0, COMPLETION_KEY_DISCONNECTED, xsi
+      .endif
+    .else
+      ; Normaler FIN-Pfad (non-TLS oder nicht von uns initiiert)
+      .ifBitClr [xsi].dFlags, NCC_CLOSED
+        OCall xsi.Disconnect, SD_RECEIVE                  ;Local shutdown receive
+      .endif
     .endif
 
   .else
 ;    DbgText "NetComConnection.OnReceived", addr [xsi].wName
     mov xdx, pIOJob
     ;We queue a new read for the one we receive here
-    OCall [xbx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.NewItem, IOJOB_RECV
-    .if xax != NULL
-      OCall xsi.DoRcvIOJob, xax                         ;Increments pending IOJobs
-    .else
-;      DbgText "NetComConnection.OnReceived - DoRcvIOJob failed", addr [xsi].wName
+    .ifBitClr [xsi].dFlags, NCC_CLOSED or NCC_QUEUE_DESTROY
+      OCall [xbx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.NewItem, IOJOB_RECV
+      .if xax != NULL
+        OCall xsi.DoRcvIOJob, xax                         ;Increments pending IOJobs
+      .else
+;        DbgText "NetComConnection.OnReceived - DoRcvIOJob failed", addr [xsi].wName
+      .endif
     .endif
 
 ;    ;Return the number of seconds a socket has been connected.
@@ -524,6 +602,25 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
         SDLL_Remove xax, xcx, xdx
         mov xcx, [xsi].pOwner
         OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
+
+        ; === Wenn WIR den TLS Shutdown initiiert haben ===
+        .ifBitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
+          BitClr [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
+          ; Peer hat close_notify bestätigt ? TCP-Level Shutdown nachholen
+          invoke shutdown, [xsi].hSocket, SD_SEND
+          BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
+          ; OnDisconnected asynchron posten (genau einmal)
+          .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
+            BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
+            mov [xsi].dDisconnectError, NO_ERROR
+            mov [xsi].dDisconnectDirection, SD_SEND      ;Wir haben initiiert
+            mov xcx, [xsi].pOwner
+            mov xax, [xcx].$Obj(NetComConnectionPool).pOwner
+            invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
+                   0, COMPLETION_KEY_DISCONNECTED, xsi
+          .endif
+        .endif
+        ; === END ===
         jmp @@TLSDone
 
       .elseif eax == TLS_STATE_DATA
@@ -593,6 +690,27 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
           ; No plaintext yet (incomplete TLS record) - mark IOJob as empty
           mov xbx, pIOJob
           mov [xbx].IOJOB.dBytesConsumed, 0
+
+          ; === Peer close_notify erkennen (SEC_I_CONTEXT_EXPIRED ? TLS_STATE_SHUTDOWN) ===
+          OCall [xsi].pTLSContext::TLS_Context.GetState
+          .if eax == TLS_STATE_SHUTDOWN
+            ; Antwort mit eigenem close_notify (RFC 8446 §6.1)
+            OCall [xsi].pTLSContext::TLS_Context.Shutdown, xsi
+            ; TCP-Level Disconnect
+            invoke shutdown, [xsi].hSocket, SD_SEND
+            BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
+            ; OnDisconnected posten — Direction = SD_RECEIVE (Peer hat initiiert)
+            .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
+              BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
+              mov [xsi].dDisconnectError, NO_ERROR
+              mov [xsi].dDisconnectDirection, SD_RECEIVE  ;Peer hat close_notify initiiert
+              mov xcx, [xsi].pOwner
+              mov xax, [xcx].$Obj(NetComConnectionPool).pOwner
+              invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
+                     0, COMPLETION_KEY_DISCONNECTED, xsi
+            .endif
+          .endif
+          ; === END ===
         .endif
         jmp @@TLSDone
 
@@ -951,12 +1069,12 @@ Method NetComConnection.QueueSend, uses xbx xdi xsi, pData:POINTER, dSize:DWORD
       sub eax, edi
       jmp @@Exit
 
-    .elseif eax == TLS_STATE_HANDSHAKE
-      ; === TLS_STATE_HANDSHAKE: Token data goes directly without encryption ===
+    .elseif eax == TLS_STATE_HANDSHAKE || eax == TLS_STATE_SHUTDOWN
+      ; === TLS_STATE_HANDSHAKE / TLS_STATE_SHUTDOWN: Token data goes directly without encryption ===
       ; Fall through to the existing send logic below (tokens are already SSPI-formatted)
 
-    .elseif eax == TLS_STATE_SHUTDOWN || eax == TLS_STATE_ERROR
-      ; === TLS_STATE_SHUTDOWN / TLS_STATE_ERROR: Do not send ===
+    .elseif eax == TLS_STATE_ERROR
+      ; === TLS_STATE_ERROR: Do not send ===
       xor eax, eax
       jmp @@Exit
 

@@ -121,7 +121,28 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
           jmp @@Retry
         .endif
 
-        ;Handle connection timeout
+        ; === TLS Shutdown Timeout ===
+        .ifBitSet [xbx].$Obj(NetComConnection).dFlags, NCC_TLS_SHUTDOWN_PENDING
+          .if ([xbx].$Obj(NetComConnection).LastTime.FILETIME.dwLowDateTime != 0 || \
+               [xbx].$Obj(NetComConnection).LastTime.FILETIME.dwHighDateTime != 0)
+            invoke GetSystemTimeAsFileTime, addr TimeNow
+            mov eax, TimeNow.FILETIME.dwLowDateTime
+            sub eax, [xbx].$Obj(NetComConnection).LastTime.FILETIME.dwLowDateTime
+            mov edx, TimeNow.FILETIME.dwHighDateTime
+            sbb edx, [xbx].$Obj(NetComConnection).LastTime.FILETIME.dwHighDateTime
+            sub eax, [xsi].dTLSShutdownTimeout
+            sbb edx, 0
+            .if SDWORD ptr edx >= 0
+              ; Timeout abgelaufen — abortives Close
+              BitClr [xbx].$Obj(NetComConnection).dFlags, NCC_TLS_SHUTDOWN_PENDING
+              OCall xbx::NetComConnection.QueueDestroy
+              OCall xbx::NetComConnection.Close, TRUE
+            .endif
+          .endif
+        .endif
+        ; === END TLS Shutdown Timeout ===
+
+        ;Handle connection inactivity timeout
         .if [xsi].dInactivityTimeout != 0                         ;0 means no timeout
           .if ([xbx].$Obj(NetComConnection).LastTime.FILETIME.dwLowDateTime != 0 || \
                [xbx].$Obj(NetComConnection).LastTime.FILETIME.dwLowDateTime != 0)
@@ -147,9 +168,28 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
 
 
       ;If the connection is flagged for destruction, proceed ONLY if the
-      ;connection has no pending IOJobs
+      ;connection has no pending IOJobs AND all async completions have been delivered
       .ifBitSet [xbx].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY
         .if [xbx].$Obj(NetComConnection).dPendingIOJobs == 0
+
+          ; === Warte bis alle geposteten Completions verarbeitet sind ===
+          mov eax, [xbx].$Obj(NetComConnection).dFlags
+
+          ; Falls DISCONNECT gepostet ? muss geliefert sein
+          test eax, NCC_DISCONNECT_POSTED
+          .if !ZERO?
+            test eax, NCC_DISCONNECTED_DELIVERED
+            jz @@Next
+          .endif
+
+          ; Falls Socket geschlossen ? CLOSED muss geliefert sein
+          test eax, NCC_CLOSED
+          .if !ZERO?
+            test eax, NCC_CLOSED_DELIVERED
+            jz @@Next
+          .endif
+          ; === Alle Completions verarbeitet — sicher zerstören ===
+
           invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
           .if eax == FALSE
             mov xcx, [xsi].pOwner

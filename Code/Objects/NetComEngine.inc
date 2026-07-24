@@ -195,10 +195,12 @@ Method NetComEngine.Done, uses xbx xdi xsi
 
   SetObject xsi
 ;  DbgText "NetComEngine.Done"
-  ;Teardown all connections
+  ;Teardown all connections — graceful TLS shutdown
   DbgLine2
-;  OCall xsi.ConnectionsDisconnect
-;  OCall xsi.ConnectionsDestroy
+  OCall xsi.ConnectionsDisconnect                       ;Sends TLS close_notify + TCP FIN
+  invoke Sleep, 500                                     ;Give worker time to send close_notify
+  OCall xsi.ConnectionsDestroy                          ;Mark all for destruction
+  OCall xsi.ConnectionsClose                            ;Close all sockets (abortive if needed)
 
   ;Close listener sockets and release DataCollection structures
   OCall [xsi].Listeners::DataCollection.Done
@@ -545,8 +547,10 @@ MethodEnd
 Method NetComEngine.WorkerJob, uses xbx xdi xsi
   local pIOJob:PIOJOB, xCompletionKey:XWORD, dBytesTransfered:DWORD
   local dFlags:DWORD, dBytesConsumed:DWORD, dOvrResult:DWORD
+  local pEngine:POINTER
 
   SetObject xsi
+  mov pEngine, xsi
   .while TRUE
     ;The GetQueuedCompletionStatus API call will return two useful pieces of information.
     ;One is the "completion key" of the completed IO, the other is a POINTER to the IOJob
@@ -557,6 +561,44 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
 
     ;Exit thread loop immediately if the call fails or COMPLETION_KEY_KILL_WORKER received
     .break .if xCompletionKey == COMPLETION_KEY_KILL_WORKER
+
+    ; ??????????????????????????????????????????????????????????????????????????
+    ; Synthetische Completions — CritSect-geschützt mit Re-Post bei Contention
+    ; pIOJob enthält hier den Connection-Pointer (kein echtes OVERLAPPED!)
+    ; ??????????????????????????????????????????????????????????????????????????
+    .if xCompletionKey == COMPLETION_KEY_DISCONNECTED
+      mov xdi, pIOJob                                    ;xdi -> NetComConnection
+      invoke TryEnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      .if eax != FALSE
+        OCall [xdi].$Obj(NetComConnection).pProtocol::NetComProtocol.OnDisconnected, \
+              xdi, [xdi].$Obj(NetComConnection).dDisconnectDirection, \
+              [xdi].$Obj(NetComConnection).dDisconnectError
+        mov xsi, pEngine                                 ;Restore Engine pointer
+        lock or [xdi].$Obj(NetComConnection).dFlags, NCC_DISCONNECTED_DELIVERED
+        invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      .else
+        ; CritSect belegt — Re-Post ans Ende der IOCP-Queue
+        invoke PostQueuedCompletionStatus, [xsi].hIOCP, \
+               0, COMPLETION_KEY_DISCONNECTED, xdi
+      .endif
+      .continue
+
+    .elseif xCompletionKey == COMPLETION_KEY_CLOSED
+      mov xdi, pIOJob                                    ;xdi -> NetComConnection
+      invoke TryEnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      .if eax != FALSE
+        OCall [xdi].$Obj(NetComConnection).pProtocol::NetComProtocol.OnClosed, xdi
+        mov xsi, pEngine                                 ;Restore Engine pointer
+        lock or [xdi].$Obj(NetComConnection).dFlags, NCC_CLOSED_DELIVERED
+        invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      .else
+        ; CritSect belegt — Re-Post
+        invoke PostQueuedCompletionStatus, [xsi].hIOCP, \
+               0, COMPLETION_KEY_CLOSED, xdi
+      .endif
+      .continue
+    .endif
+    ; ??????????????????????????????????????????????????????????????????????????
 
     mov xbx, pIOJob
     .if xbx != NULL
@@ -623,14 +665,28 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
       ;NOTE: this code was moved to the supervisor thread, but if not presend, do the disposal here
       .if [xsi].pSupervisor == NULL
         ;If the connection is flagged for destruction, proceed ONLY if the
-        ;connection has no pending IOJobs
+        ;connection has no pending IOJobs AND all async completions delivered
         .ifBitSet [xdi].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY
           .if [xdi].$Obj(NetComConnection).dPendingIOJobs == 0
+            ; Warte auf gepostete Completions
+            mov eax, [xdi].$Obj(NetComConnection).dFlags
+            test eax, NCC_DISCONNECT_POSTED
+            .if !ZERO?
+              test eax, NCC_DISCONNECTED_DELIVERED
+              jz @@SkipDestroy
+            .endif
+            test eax, NCC_CLOSED
+            .if !ZERO?
+              test eax, NCC_CLOSED_DELIVERED
+              jz @@SkipDestroy
+            .endif
+
             OCall xdi::NetComConnection.FreeRessources    ;Socket is closed here
             invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
             OCall xdi::NetComConnection.Done
             OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xdi
             .continue
+          @@SkipDestroy:
           .endif
         .endif
       .endif

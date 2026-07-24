@@ -1577,14 +1577,17 @@ Method TLS_SChannelContext.Shutdown, uses xbx xdi xsi, pConnection:POINTER
 
   ; If output token was generated, send it to the peer
   .if OutBuffer.cbBuffer > 0 && OutBuffer.pvBuffer != NULL
-    ; Send shutdown token via QueueSend
+    ; Set state to SHUTDOWN BEFORE QueueSend so the token bypasses encryption
+    mov [xsi].dState, TLS_STATE_SHUTDOWN
+    ; Send shutdown token via QueueSend (passes through as raw data like handshake tokens)
     OCall pConnection::NetComConnection.QueueSend, OutBuffer.pvBuffer, OutBuffer.cbBuffer
     ; Free the allocated output buffer (SSPI allocated it with ISC_REQ_ALLOCATE_MEMORY)
     invoke FreeContextBuffer, OutBuffer.pvBuffer
+  .else
+    ; No token generated, just set state
+    mov [xsi].dState, TLS_STATE_SHUTDOWN
   .endif
 
-  ; Set state to SHUTDOWN
-  mov [xsi].dState, TLS_STATE_SHUTDOWN
   mov eax, OBJ_OK
 
 @@Exit:
