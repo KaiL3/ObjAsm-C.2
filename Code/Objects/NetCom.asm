@@ -39,8 +39,6 @@ LoadObjects SortedDataCollection
 LoadObjects XWCollection
 LoadObjects DataPool
 LoadObjects StopWatch
-LoadObjects TLS_Context
-LoadObjects TLS_SChannelContext
 
 ;Add here the file that defines the object(s) to be included in the library
 MakeObjects NetCom

@@ -271,6 +271,13 @@ endif
 
 
 ; ==================================================================================================
+;    Handshake Buffer Constants
+; ==================================================================================================
+
+TLS_HANDSHAKE_BUFFER_SIZE   equ   16384     ;Max TLS record size (sufficient for handshake messages)
+
+
+; ==================================================================================================
 ;    TLS_SChannelContext Object Definition
 ; ==================================================================================================
 
@@ -318,12 +325,7 @@ Object TLS_SChannelContext, TLS_SChannelContextID, TLS_Context
   ; Stream-Sizes (nach erfolgreichem Handshake)
   DefineVariable  StreamSizes,        SecPkgContext_StreamSizes, {}
 
-  ; Reassembly-Puffer (Empfangsrichtung)
-  DefineVariable  pReassemblyBuffer,  POINTER,        NULL
-  DefineVariable  dReassemblyCapacity, DWORD,         0
-  DefineVariable  dReassemblyUsed,    DWORD,          0
-
-  ; VerschlÃ¼sselungspuffer (Senderichtung)
+  ; Verschluesselungspuffer (Senderichtung)
   DefineVariable  pEncryptBuffer,     POINTER,        NULL
   DefineVariable  dEncryptBufferSize, DWORD,          0
 
@@ -387,6 +389,7 @@ Method TLS_SChannelContext.Init, uses xsi, pOwner:POINTER
   mov [xsi].dReassemblyUsed, 0
   mov [xsi].pEncryptBuffer, NULL
   mov [xsi].dEncryptBufferSize, 0
+  mov [xsi].pDeferredExtra, NULL
 
   ; Reset negotiated parameters
   mov [xsi].dNegotiatedProtocol, 0
@@ -449,16 +452,26 @@ Method TLS_SChannelContext.AllocateBuffers, uses xbx xsi
   add eax, [xsi].StreamSizes.cbTrailer
   mov dRequiredSize, eax
 
-  ; Allocate Reassembly buffer (zero-initialized)
-  MemAlloc dRequiredSize, MEM_INIT_ZERO
-  .if xax == NULL
-    ; Allocation failed
-    mov [xsi].dState, TLS_STATE_ERROR
-    mov eax, TLS_BUFFER_ALLOC_FAILED
-    jmp @@Exit
+  ; Reallocate Reassembly buffer if needed (may already exist from handshake)
+  .if [xsi].pReassemblyBuffer != NULL
+    ; Check if existing buffer is large enough
+    mov eax, dRequiredSize
+    .if eax > [xsi].dReassemblyCapacity
+      ; Need larger buffer - free old one and allocate new
+      MemFree [xsi].pReassemblyBuffer
+      mov [xsi].pReassemblyBuffer, NULL
+    .endif
   .endif
-  mov [xsi].pReassemblyBuffer, xax
-  m2m [xsi].dReassemblyCapacity, dRequiredSize, eax
+  .if [xsi].pReassemblyBuffer == NULL
+    MemAlloc dRequiredSize, MEM_INIT_ZERO
+    .if xax == NULL
+      mov [xsi].dState, TLS_STATE_ERROR
+      mov eax, TLS_BUFFER_ALLOC_FAILED
+      jmp @@Exit
+    .endif
+    mov [xsi].pReassemblyBuffer, xax
+    m2m [xsi].dReassemblyCapacity, dRequiredSize, eax
+  .endif
   mov [xsi].dReassemblyUsed, 0
 
   ; Allocate Encryption buffer (zero-initialized)
@@ -641,34 +654,11 @@ Method TLS_SChannelContext.Decrypt, uses xbx xdi xsi, pCiphertext:POINTER, dSize
 
   SetObject xsi
 
-  ; --- Step 1: Copy incoming ciphertext into Reassembly buffer ---
-  ; Verify there's enough room: dReassemblyUsed + dSize <= dReassemblyCapacity
-  mov eax, [xsi].dReassemblyUsed
-  add eax, dSize
-  .if eax > [xsi].dReassemblyCapacity
-    ; Buffer overflow - signal error
-    mov [xsi].dState, TLS_STATE_ERROR
-    mov [xsi].dLastError, SEC_E_INCOMPLETE_MESSAGE
-    ; Set output to NULL/0
-    mov xbx, ppPlaintext
-    mov POINTER ptr [xbx], NULL
-    mov xbx, pdPlaintextSize
-    mov DWORD ptr [xbx], 0
-    mov eax, TLS_DECRYPT_ERROR
-    jmp @@Exit
-  .endif
+  ; Data is already in the reassembly buffer (copied by OnReceivedTLS drain loop).
+  ; pCiphertext/dSize point to pReassemblyBuffer/dReassemblyUsed (passed for interface compatibility).
+  ; No copy needed - proceed directly to decryption.
 
-  ; Copy pCiphertext to (pReassemblyBuffer + dReassemblyUsed)
-  mov xdi, [xsi].pReassemblyBuffer
-  mov eax, [xsi].dReassemblyUsed
-  add xdi, xax                                    ; xdi = destination address
-  invoke MemClone, xdi, pCiphertext, dSize
-
-  ; Update dReassemblyUsed += dSize
-  mov eax, dSize
-  add [xsi].dReassemblyUsed, eax
-
-  ; --- Step 2: Set up SecBufferDesc with 4 SecBuffers ---
+  ; --- Set up SecBufferDesc with 4 SecBuffers ---
   mov BufferDesc.ulVersion, SECBUFFER_VERSION
   mov BufferDesc.cBuffers, 4
   lea xax, Buffers
@@ -739,13 +729,13 @@ Method TLS_SChannelContext.Decrypt, uses xbx xdi xsi, pCiphertext:POINTER, dSize
       jmp @@Success
     .endif
     .if [xdi].SecBuffer.BufferType == SECBUFFER_EXTRA
-      ; SECBUFFER_EXTRA found: move extra data to start of reassembly buffer
-      ; Source: pvBuffer of EXTRA buffer
-      ; Destination: pReassemblyBuffer
-      ; Size: cbBuffer of EXTRA buffer
+      ; SECBUFFER_EXTRA found: defer the shift - plaintext pointer is still valid in buffer!
+      ; Store EXTRA size and source pointer for caller to shift after copying plaintext.
       mov eax, [xdi].SecBuffer.cbBuffer
-      mov [xsi].dReassemblyUsed, eax              ; dReassemblyUsed = EXTRA's cbBuffer
-      invoke MemShift, [xsi].pReassemblyBuffer, [xdi].SecBuffer.pvBuffer, [xsi].dReassemblyUsed
+      mov [xsi].dReassemblyUsed, eax
+      ; Do NOT shift here - pPlaintext still points into the buffer!
+      ; Caller (OnReceivedTLS) will call MemShift after copying plaintext.
+      m2m [xsi].pDeferredExtra, [xdi].SecBuffer.pvBuffer, xax
       jmp @@Success
     .endif
     add xdi, sizeof SecBuffer
@@ -864,7 +854,7 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   lea xax, InBuffers
   mov InBufferDesc.pBuffers, xax
 
-  ; InBuffer[0]: SECBUFFER_TOKEN with received handshake data
+  ; InBuffer[0]: SECBUFFER_TOKEN with handshake data (already in reassembly buffer)
   m2m InBuffers[0 * sizeof SecBuffer].cbBuffer, dDataSize, eax
   mov InBuffers[0 * sizeof SecBuffer].BufferType, SECBUFFER_TOKEN
   m2m InBuffers[0 * sizeof SecBuffer].pvBuffer, pData, xax
@@ -913,9 +903,9 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       invoke FreeContextBuffer, OutBuffer.pvBuffer
     .endif
 
-    ; Handle SECBUFFER_EXTRA: if InBuffers[1] became SECBUFFER_EXTRA, preserve extra data
+    ; Handle SECBUFFER_EXTRA: preserve unconsumed data in reassembly buffer
     .if InBuffers[1 * sizeof SecBuffer].BufferType == SECBUFFER_EXTRA
-      ; Extra data starts at (pData + dDataSize - ExtraBuffer.cbBuffer)
+      ; Extra data is at (pData + dDataSize - ExtraBuffer.cbBuffer)
       mov eax, InBuffers[1 * sizeof SecBuffer].cbBuffer
       mov xbx, pData
       mov ecx, dDataSize
@@ -923,9 +913,10 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       add xbx, xcx                            ; xbx = start of extra data
       ; Move extra data to the reassembly buffer start
       mov [xsi].dReassemblyUsed, eax
-      .if [xsi].pReassemblyBuffer != NULL
-        invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-      .endif
+      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
+    .else
+      ; All data consumed
+      mov [xsi].dReassemblyUsed, 0
     .endif
 
     mov eax, OBJ_OK
@@ -952,6 +943,9 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       mov [xsi].dState, TLS_STATE_ERROR
       jmp @@HandshakeFailed
     .endif
+
+    ; Publish max plaintext size to base class for polymorphic access
+    m2m [xsi].dMaxMessageSize, [xsi].StreamSizes.cbMaximumMessage, eax
 
     ; (c) Set state to TLS_STATE_DATA, context is valid
     mov [xsi].dState, TLS_STATE_DATA
@@ -990,9 +984,9 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       sub ecx, eax
       add xbx, xcx
       mov [xsi].dReassemblyUsed, eax
-      .if [xsi].pReassemblyBuffer != NULL
-        invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-      .endif
+      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
+    .else
+      mov [xsi].dReassemblyUsed, 0
     .endif
 
     ; (f) Call OnHandshakeComplete on the protocol
@@ -1084,6 +1078,17 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
     ; Retry InitializeSecurityContext with the same input data
     jmp @@RetryISC
 
+  .elseif dStatus == SEC_E_INCOMPLETE_MESSAGE
+    ; --- SEC_E_INCOMPLETE_MESSAGE: Need more data from server ---
+    ; Data remains in the reassembly buffer (passed as pData, dDataSize is dReassemblyUsed).
+    ; dReassemblyUsed stays unchanged — caller will append more data on next call.
+    ; Free output buffer if any
+    .if OutBuffer.pvBuffer != NULL
+      invoke FreeContextBuffer, OutBuffer.pvBuffer
+    .endif
+    mov eax, OBJ_OK
+    jmp @@Exit
+
   .else
     ; --- Any other status: Handshake failed ---
     ; NOTE: This handler covers both:
@@ -1135,13 +1140,14 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   ; ===========================================================================
 @@ServerPath:
 
+@@RetryASC:
   ; --- Build input SecBufferDesc for AcceptSecurityContext ---
   mov InBufferDesc.ulVersion, SECBUFFER_VERSION
   mov InBufferDesc.cBuffers, 2
   lea xax, InBuffers
   mov InBufferDesc.pBuffers, xax
 
-  ; InBuffer[0]: SECBUFFER_TOKEN with received client handshake data
+  ; InBuffer[0]: SECBUFFER_TOKEN with handshake data (already in reassembly buffer)
   m2m InBuffers[0 * sizeof SecBuffer].cbBuffer, dDataSize, eax
   mov InBuffers[0 * sizeof SecBuffer].BufferType, SECBUFFER_TOKEN
   m2m InBuffers[0 * sizeof SecBuffer].pvBuffer, pData, xax
@@ -1222,9 +1228,9 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       sub ecx, eax
       add xbx, xcx                            ; xbx = start of extra data
       mov [xsi].dReassemblyUsed, eax
-      .if [xsi].pReassemblyBuffer != NULL
-        invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-      .endif
+      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
+    .else
+      mov [xsi].dReassemblyUsed, 0
     .endif
 
     mov eax, OBJ_OK
@@ -1252,6 +1258,9 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       mov [xsi].dState, TLS_STATE_ERROR
       jmp @@ServerHandshakeFailed
     .endif
+
+    ; Publish max plaintext size to base class for polymorphic access
+    m2m [xsi].dMaxMessageSize, [xsi].StreamSizes.cbMaximumMessage, eax
 
     ; (c) Set state to TLS_STATE_DATA
     mov [xsi].dState, TLS_STATE_DATA
@@ -1286,9 +1295,9 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       sub ecx, eax
       add xbx, xcx
       mov [xsi].dReassemblyUsed, eax
-      .if [xsi].pReassemblyBuffer != NULL
-        invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-      .endif
+      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
+    .else
+      mov [xsi].dReassemblyUsed, 0
     .endif
 
     ; (e) Call OnHandshakeComplete on the protocol
@@ -1380,6 +1389,19 @@ Method TLS_SChannelContext.StartClientHandshake, uses xbx xdi xsi, pConnection:P
     ; Credential initialization failed
     mov [xsi].dState, TLS_STATE_ERROR
     jmp @@Exit
+  .endif
+
+  ; Allocate reassembly buffer early for handshake data accumulation
+  .if [xsi].pReassemblyBuffer == NULL
+    MemAlloc TLS_HANDSHAKE_BUFFER_SIZE, MEM_INIT_ZERO
+    .if xax == NULL
+      mov [xsi].dState, TLS_STATE_ERROR
+      mov eax, TLS_BUFFER_ALLOC_FAILED
+      jmp @@Exit
+    .endif
+    mov [xsi].pReassemblyBuffer, xax
+    mov [xsi].dReassemblyCapacity, TLS_HANDSHAKE_BUFFER_SIZE
+    mov [xsi].dReassemblyUsed, 0
   .endif
 
   ; Prepare output SecBufferDesc for InitializeSecurityContext
@@ -1474,6 +1496,19 @@ Method TLS_SChannelContext.StartServerHandshake, uses xbx xsi, pConnection:POINT
 
     mov eax, TLS_HANDSHAKE_FAILED
     jmp @@Exit
+  .endif
+
+  ; Allocate reassembly buffer early for handshake data accumulation
+  .if [xsi].pReassemblyBuffer == NULL
+    MemAlloc TLS_HANDSHAKE_BUFFER_SIZE, MEM_INIT_ZERO
+    .if xax == NULL
+      mov [xsi].dState, TLS_STATE_ERROR
+      mov eax, TLS_BUFFER_ALLOC_FAILED
+      jmp @@Exit
+    .endif
+    mov [xsi].pReassemblyBuffer, xax
+    mov [xsi].dReassemblyCapacity, TLS_HANDSHAKE_BUFFER_SIZE
+    mov [xsi].dReassemblyUsed, 0
   .endif
 
   ; Server is now in HANDSHAKE state, waiting for client's ClientHello
@@ -1668,8 +1703,9 @@ Method TLS_SChannelContext.InitCredentials, uses xbx xsi, dUsage:DWORD
     mov SchannelCred.cCreds, 0
     mov SchannelCred.paCred, NULL
 
-    ; Client flags: no default creds + strong crypto
+    ; Client flags: no default creds + strong crypto + disable session cache
     mov SchannelCred.dwFlags, SCH_CRED_NO_DEFAULT_CREDS or SCH_USE_STRONG_CRYPTO
+    mov SchannelCred.dwSessionLifespan, 1     ;Minimal lifespan - effectively disables session cache
 
   .endif
 

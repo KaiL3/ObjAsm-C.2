@@ -122,6 +122,13 @@ Object TLS_Context, TLS_ContextID, Primer
   DefineVariable    dAllowedProtocols,    DWORD,    SP_PROT_TLS1_2 or SP_PROT_TLS1_3
   DefineVariable    pAllowedCipherSuites, POINTER,  NULL
   DefineVariable    dCipherSuiteCount,    DWORD,    0
+  DefineVariable    dMaxMessageSize,      DWORD,    0     ;Max plaintext bytes per TLS record (set after handshake)
+
+  ; Reassembly buffer (managed by derived class, accessed by NetComConnection)
+  DefineVariable    pReassemblyBuffer,    POINTER,  NULL
+  DefineVariable    dReassemblyCapacity,  DWORD,    0
+  DefineVariable    dReassemblyUsed,      DWORD,    0
+  DefineVariable    pDeferredExtra,       POINTER,  NULL  ;Deferred EXTRA shift pointer (set by Decrypt)
 ObjectEnd
 
 

@@ -440,6 +440,10 @@ Object NetComConnection, NetComConnectionID, Primer
   VirtualMethod   DoRcvIOJob,         PIOJOB
   VirtualMethod   DoSndIOJob,         PIOJOB
 
+  ;TLS internal helpers (not intended for external use)
+  StaticMethod    OnReceivedTLS,      PIOJOB            ;TLS state-machine for received data
+  StaticMethod    QueueSendTLS,       POINTER, DWORD    ;TLS encrypt and send
+
   ;Networking stuff
   DefineVariable  dFlags,             DWORD,            0
   DefineVariable  ChainItem,          SDLL_ITEM,        {NULL, NULL} ;Link to other Connections
@@ -461,6 +465,7 @@ Object NetComConnection, NetComConnectionID, Primer
 
   ;Management
   DefineVariable  pTLSContext,        POINTER,          NULL  ;-> TLS_Context or NULL
+  DefineVariable  PlaintextChain,     SDLL_SENTINEL,    {NULL, NULL}  ;Decrypted data chain (TLS only)
   DefineVariable  pData,              POINTER,          NULL  ;-> Data managed by the protocol
   DefineVariable  dDisconnectError,   DWORD,            0     ;Error-Code für async OnDisconnected
   DefineVariable  dDisconnectDirection, DWORD,          0     ;Direction für async OnDisconnected (SD_xxx)
@@ -845,6 +850,7 @@ endm
 
 ; ==================================================================================================
 
+include TLS_Context.inc             ;Abstract TLS base class (required by NetComConnection)
 include NetComAddrCollection.inc    ;Collection for handling of NETCOMADDR structures
 include NetComProtocol.inc          ;Base object for handling of Network Events
 include NetComIOJobPool.inc         ;Object for recycling of NetComIOJob objects
