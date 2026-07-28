@@ -20,7 +20,7 @@ Object TLS_Connection_Config, TLS_Connection_ConfigID, Primer
   RedefineMethod  Done
 
   ; --- Builder methods (config creator sets these BEFORE handing to connection) ---
-  VirtualMethod   SetTargetName,        POINTER           ; pszHostname ANSI (copied!)
+  VirtualMethod   SetTargetName,        POINTER           ; pszHostname (ANSI/WIDE, stored as ANSI)
   VirtualMethod   SetAllowedProtocols,  DWORD             ; SP_PROT_TLS1_x bitmask
   VirtualMethod   SetCipherSuites,      POINTER, DWORD    ; pAlgIDArray, dCount (copied!)
   VirtualMethod   SetCertValidator,     POINTER           ; -> TLS_CertValidator instance/template
@@ -90,7 +90,7 @@ MethodEnd
 Method TLS_Connection_Config.Done, uses xsi
   SetObject xsi
   .if [xsi].pTargetName != NULL
-    MemFree [xsi].pTargetName
+    invoke StrDispose, [xsi].pTargetName
     mov [xsi].pTargetName, NULL
   .endif
   .if [xsi].pCipherSuites != NULL
@@ -103,26 +103,26 @@ MethodEnd
 ; --------------------------------------------------------------------------------------------------
 ; Method:     TLS_Connection_Config.SetTargetName
 ; Purpose:    Sets the target server hostname for SNI. The string is COPIED into owned memory.
-; Arguments:  Arg1: -> ANSI hostname string (or NULL to clear).
+;             Accepts ANSI or WIDE depending on TARGET_STR_TYPE, stores always as ANSI
+;             (SChannel requirement). Freed with StrDispose.
+; Arguments:  Arg1: -> Hostname string in current TARGET_STR_TYPE (or NULL to clear).
 ; Return:     Nothing.
 
-Method TLS_Connection_Config.SetTargetName, uses xbx xsi, pszHostname:POINTER
+Method TLS_Connection_Config.SetTargetName, uses xsi, pszHostname:POINTER
   SetObject xsi
   ; Free previous
   .if [xsi].pTargetName != NULL
-    MemFree [xsi].pTargetName
+    invoke StrDispose, [xsi].pTargetName
     mov [xsi].pTargetName, NULL
   .endif
-  ; Copy new
+  ; Copy new (convert to ANSI if WIDE build)
   .if pszHostname != NULL
-    invoke StrLengthA, pszHostname
-    inc eax                                             ; Include ZTC
-    mov ebx, eax
-    MemAlloc ebx
-    .if xax != NULL
-      mov [xsi].pTargetName, xax
-      invoke MemClone, xax, pszHostname, ebx
-    .endif
+    if TARGET_STR_TYPE eq STR_TYPE_WIDE
+      invoke StrW2NewStrA, pszHostname
+    else
+      invoke StrNewA, pszHostname
+    endif
+    mov [xsi].pTargetName, xax
   .endif
 MethodEnd
 
