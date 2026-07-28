@@ -1288,6 +1288,10 @@ Method NetComConnection.ApplyTLSConfig, uses xbx xsi, pConfig:POINTER
   .if pAlgs != NULL
     OCall [xsi].pTLSContext::TLS_Context.SetAllowedCipherSuites, pAlgs, dCount
   .endif
+
+  ; VerifyServerName flag
+  OCall xbx::TLS_Connection_Config.GetVerifyServerName
+  OCall [xsi].pTLSContext::TLS_Context.SetVerifyServerName, eax
 MethodEnd
 
 endif

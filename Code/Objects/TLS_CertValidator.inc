@@ -20,7 +20,7 @@
 ; Notes:      This is a pure abstract class – Validate must be overridden by derived classes.
 
 Object TLS_CertValidator, TLS_CertValidatorID, Primer
-  VirtualAbstract   Validate,         POINTER         ; pCertContext -> HRESULT in eax
+  VirtualAbstract   Validate,         POINTER, POINTER ; pCertContext, pszServerName (ANSI or NULL) -> HRESULT in eax
 ObjectEnd
 
 

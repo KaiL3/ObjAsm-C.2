@@ -414,6 +414,12 @@ MethodEnd
 Method TLS_SChannelContext.Done, uses xbx xsi
   SetObject xsi
 
+  ; Free owned TargetName string
+  .if [xsi].pTargetName != NULL
+    invoke StrDispose, [xsi].pTargetName
+    mov [xsi].pTargetName, NULL
+  .endif
+
   ; Free internal buffers
   OCall xsi.FreeBuffers
 
@@ -963,7 +969,12 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
     .if eax == SEC_E_OK && pCertContext != NULL
       ; Delegate to CertValidator if one is set
       .if [xsi].pCertValidator != NULL
-        OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext
+        ; Pass pTargetName for hostname verification if bVerifyServerName is TRUE
+        .if [xsi].bVerifyServerName == TRUE
+          OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, [xsi].pTargetName
+        .else
+          OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, NULL
+        .endif
         .if eax != 0
           ; (e) Validation failed: close connection
           mov [xsi].dLastError, eax
@@ -1276,7 +1287,7 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
       invoke QueryContextAttributes, xbx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, addr pCertContext
 
       .if eax == SEC_E_OK && pCertContext != NULL
-        OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext
+        OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, NULL
         .if eax != 0
           ; Client certificate validation failed
           mov [xsi].dLastError, eax

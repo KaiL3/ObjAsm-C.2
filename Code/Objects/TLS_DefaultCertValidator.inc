@@ -5,9 +5,12 @@
 ; Purpose:    ObjAsm default implementation of TLS certificate validation.
 ;             Validates peer certificates using Windows CertGetCertificateChain and
 ;             CertVerifyCertificateChainPolicy (CERT_CHAIN_POLICY_SSL).
+;             Optionally verifies hostname (CN/SAN) via SSL_EXTRA_CERT_CHAIN_POLICY_PARA.
 ; Links:      - https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatechain
 ;             - https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certverifycertificatechainpolicy
-; Notes:      Version C.1.0
+; Notes:      Version C.2.0
+;               - Added hostname verification via pszServerName parameter.
+;             Version C.1.0
 ;               - Initial release.
 ; ==================================================================================================
 
@@ -25,7 +28,7 @@
 ;               - Or the dwError from CERT_CHAIN_POLICY_STATUS for other failures
 
 Object TLS_DefaultCertValidator, TLS_DefaultCertValidatorID, TLS_CertValidator
-  RedefineMethod  Validate,           POINTER         ; pCertContext -> HRESULT in eax
+  RedefineMethod  Validate,           POINTER, POINTER  ; pCertContext, pszServerName (ANSI or NULL)
 ObjectEnd
 
 ; ==================================================================================================
@@ -41,16 +44,22 @@ if IMPLEMENT
 ; Purpose:    Validates a peer certificate by building and verifying the certificate chain.
 ;             Uses CertGetCertificateChain to build the chain, then
 ;             CertVerifyCertificateChainPolicy with CERT_CHAIN_POLICY_SSL to verify it.
+;             If pszServerName is provided (non-NULL), additionally verifies the certificate
+;             CN/SAN against the hostname using SSL_EXTRA_CERT_CHAIN_POLICY_PARA.
 ; Arguments:  Arg1: -> CERT_CONTEXT (peer certificate to validate).
+;             Arg2: -> ANSI server hostname for CN/SAN check (or NULL to skip hostname check).
 ; Return:     eax = HRESULT (S_OK on success, CERT_E_xxx on failure).
 
-Method TLS_DefaultCertValidator.Validate, uses xdi xsi, pCertContext:POINTER
+Method TLS_DefaultCertValidator.Validate, uses xbx xdi xsi, pCertContext:POINTER, pszServerName:POINTER
   local ChainPara:CERT_CHAIN_PARA
   local PolicyPara:CERT_CHAIN_POLICY_PARA
   local PolicyStatus:CERT_CHAIN_POLICY_STATUS
   local pChainContext:PCCERT_CHAIN_CONTEXT
+  local SslPolicyPara:SSL_EXTRA_CERT_CHAIN_POLICY_PARA
+  local pWideServerName:POINTER
 
   SetObject xsi
+  mov pWideServerName, NULL
 
   ; --- Validate input ---
   .if pCertContext == NULL
@@ -87,7 +96,7 @@ Method TLS_DefaultCertValidator.Validate, uses xdi xsi, pCertContext:POINTER
          addr pChainContext                     ; ppChainContext (output)
 
   .if eax == FALSE
-    ; CertGetCertificateChain failed – cannot build chain
+    ; CertGetCertificateChain failed - cannot build chain
     mov eax, CERT_E_UNTRUSTEDROOT
     jmp @@Exit
   .endif
@@ -96,6 +105,21 @@ Method TLS_DefaultCertValidator.Validate, uses xdi xsi, pCertContext:POINTER
   mov PolicyPara.cbSize, sizeof(CERT_CHAIN_POLICY_PARA)
   mov PolicyPara.dwFlags, 0
   mov PolicyPara.pvExtraPolicyPara, NULL
+
+  ; --- Setup SSL_EXTRA_CERT_CHAIN_POLICY_PARA for hostname verification ---
+  .if pszServerName != NULL
+    ; Convert ANSI hostname to WIDE (required by SSL_EXTRA_CERT_CHAIN_POLICY_PARA.pwszServerName)
+    invoke StrA2NewStrW, pszServerName
+    mov pWideServerName, xax
+    .if xax != NULL
+      mov SslPolicyPara.cbSize, sizeof(SSL_EXTRA_CERT_CHAIN_POLICY_PARA)
+      mov SslPolicyPara.dwAuthType, AUTHTYPE_SERVER
+      mov SslPolicyPara.fdwChecks, 0
+      m2m SslPolicyPara.pwszServerName, pWideServerName, xax
+      lea xax, SslPolicyPara
+      mov PolicyPara.pvExtraPolicyPara, xax
+    .endif
+  .endif
 
   ; --- Initialize CERT_CHAIN_POLICY_STATUS ---
   mov PolicyStatus.cbSize, sizeof(CERT_CHAIN_POLICY_STATUS)
@@ -106,7 +130,7 @@ Method TLS_DefaultCertValidator.Validate, uses xdi xsi, pCertContext:POINTER
 
   ; --- Verify certificate chain policy (CERT_CHAIN_POLICY_SSL) ---
   invoke CertVerifyCertificateChainPolicy, \
-         CERT_CHAIN_POLICY_SSL, \    ; pszPolicyOID (MAKEINTRESOURCE-style)
+         CERT_CHAIN_POLICY_SSL, \              ; pszPolicyOID (MAKEINTRESOURCE-style)
          pChainContext, \                       ; pChainContext
          addr PolicyPara, \                     ; pPolicyPara
          addr PolicyStatus                      ; pPolicyStatus
@@ -114,6 +138,9 @@ Method TLS_DefaultCertValidator.Validate, uses xdi xsi, pCertContext:POINTER
   .if eax == FALSE
     ; CertVerifyCertificateChainPolicy API call itself failed
     invoke CertFreeCertificateChain, pChainContext
+    .if pWideServerName != NULL
+      invoke StrDispose, pWideServerName
+    .endif
     mov eax, CERT_E_UNTRUSTEDROOT
     jmp @@Exit
   .endif
@@ -123,6 +150,9 @@ Method TLS_DefaultCertValidator.Validate, uses xdi xsi, pCertContext:POINTER
   .if eax == 0
     ; Validation successful
     invoke CertFreeCertificateChain, pChainContext
+    .if pWideServerName != NULL
+      invoke StrDispose, pWideServerName
+    .endif
     xor eax, eax                                ; S_OK = 0
     jmp @@Exit
   .endif
@@ -131,12 +161,15 @@ Method TLS_DefaultCertValidator.Validate, uses xdi xsi, pCertContext:POINTER
   ; The dwError already contains a meaningful HRESULT from the chain policy engine.
   ; We pass it through directly, as it maps to CERT_E_EXPIRED, CERT_E_UNTRUSTEDROOT,
   ; CERT_E_CN_NO_MATCH, etc. depending on the specific failure.
-  mov edi, eax                                  ; Save error code
+  mov ebx, eax                                  ; Save error code
 
-  ; Free the chain context before returning
+  ; Free resources before returning
   invoke CertFreeCertificateChain, pChainContext
+  .if pWideServerName != NULL
+    invoke StrDispose, pWideServerName
+  .endif
 
-  mov eax, edi                                  ; Return the policy status error as HRESULT
+  mov eax, ebx                                  ; Return the policy status error as HRESULT
 
 @@Exit:
 MethodEnd

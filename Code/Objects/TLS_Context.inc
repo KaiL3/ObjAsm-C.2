@@ -113,6 +113,7 @@ Object TLS_Context, TLS_ContextID, Primer
   VirtualMethod     SetAllowedProtocols,    DWORD         ; dProtocolBitmask
   VirtualMethod     SetAllowedCipherSuites, POINTER, DWORD  ; pAlgIDArray, dCount
   VirtualMethod     SetTargetName,          POINTER       ; pszTargetName (ANSI, for SNI + cert validation)
+  VirtualMethod     SetVerifyServerName,    DWORD         ; TRUE/FALSE
   VirtualMethod     GetNegotiatedProtocol                 ; Return in eax
   VirtualMethod     GetNegotiatedCipherSuite              ; Return in eax
 
@@ -124,7 +125,8 @@ Object TLS_Context, TLS_ContextID, Primer
   DefineVariable    pAllowedCipherSuites, POINTER,  NULL
   DefineVariable    dCipherSuiteCount,    DWORD,    0
   DefineVariable    dMaxMessageSize,      DWORD,    0     ;Max plaintext bytes per TLS record (set after handshake)
-  DefineVariable    pTargetName,          POINTER,  NULL  ;Server hostname for SNI (ANSI string, caller-owned)
+  DefineVariable    pTargetName,          POINTER,  NULL  ;Server hostname for SNI (ANSI, owned via StrNewA)
+  DefineVariable    bVerifyServerName,    DWORD,    TRUE  ;Validate cert CN/SAN against pTargetName
 
   ; Reassembly buffer (managed by derived class, accessed by NetComConnection)
   DefineVariable    pReassemblyBuffer,    POINTER,  NULL
@@ -242,14 +244,36 @@ MethodEnd
 ; --------------------------------------------------------------------------------------------------
 ; Method:     TLS_Context.SetTargetName
 ; Purpose:    Sets the target server hostname for SNI (Server Name Indication) and
-;             certificate validation. The pointer must remain valid for the lifetime
-;             of the TLS session (caller-owned string, not copied).
+;             certificate validation. The string is COPIED into owned memory (StrNewA).
+;             Previous value is freed via StrDispose.
 ; Arguments:  Arg1: -> ANSI hostname string (or NULL to disable SNI).
 ; Return:     Nothing.
 
 Method TLS_Context.SetTargetName, uses xsi, pszName:POINTER
   SetObject xsi
-  m2m [xsi].pTargetName, pszName, xax
+  ; Free previous
+  DbgStrA pszName
+  .if [xsi].pTargetName != NULL
+    invoke StrDispose, [xsi].pTargetName
+    mov [xsi].pTargetName, NULL
+  .endif
+  ; Copy new
+  .if pszName != NULL
+    invoke StrNewA, pszName
+    mov [xsi].pTargetName, xax
+    DbgStrA [xsi].pTargetName
+  .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_Context.SetVerifyServerName
+; Purpose:    Sets whether to verify server certificate CN/SAN against the target hostname.
+; Arguments:  Arg1: TRUE to verify, FALSE to skip hostname verification.
+; Return:     Nothing.
+
+Method TLS_Context.SetVerifyServerName, uses xsi, bVerify:DWORD
+  SetObject xsi
+  m2m [xsi].bVerifyServerName, bVerify, eax
 MethodEnd
 
 endif

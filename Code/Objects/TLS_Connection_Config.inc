@@ -45,6 +45,7 @@ Object TLS_Connection_Config, TLS_Connection_ConfigID, Primer
   DefineVariable  pCipherSuites,        POINTER,  NULL    ; Heap-copied ALG_ID array (owned)
   DefineVariable  dCipherSuiteCount,    DWORD,    0
   DefineVariable  pCertValidator,       POINTER,  NULL    ; Reference (not owned)
+  DefineVariable  bValidatorIsSet,      BOOL,     FALSE   ; Indicator if Validator is set
   DefineVariable  pClientCertProvider,  POINTER,  NULL    ; Reference (not owned)
   DefineVariable  pServerCertProvider,  POINTER,  NULL    ; Reference (not owned)
   DefineVariable  bVerifyServerName,    DWORD,    TRUE
@@ -175,6 +176,7 @@ MethodEnd
 Method TLS_Connection_Config.SetCertValidator, uses xsi, pValidator:POINTER
   SetObject xsi
   m2m [xsi].pCertValidator, pValidator, xax
+  mov [xsi].bValidatorIsSet, TRUE
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -272,7 +274,11 @@ MethodEnd
 
 Method TLS_Connection_Config.GetCertValidator
   SetObject xcx
-  mov xax, [xcx].pCertValidator
+  .if [xcx].bValidatorIsSet
+    mov xax, [xcx].pCertValidator
+  .else
+    lea xax, offset $ObjTmpl(TLS_DefaultCertValidator)
+  .endif
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
