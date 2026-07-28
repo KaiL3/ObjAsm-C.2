@@ -443,6 +443,7 @@ Object NetComConnection, NetComConnectionID, Primer
   ;TLS internal helpers (not intended for external use)
   StaticMethod    OnReceivedTLS,      PIOJOB            ;TLS state-machine for received data
   StaticMethod    QueueSendTLS,       POINTER, DWORD    ;TLS encrypt and send
+  StaticMethod    ApplyTLSConfig,     POINTER           ;Apply TLS_Connection_Config to pTLSContext
 
   ;Networking stuff
   DefineVariable  dFlags,             DWORD,            0
@@ -467,8 +468,8 @@ Object NetComConnection, NetComConnectionID, Primer
   DefineVariable  pTLSContext,        POINTER,          NULL  ;-> TLS_Context or NULL
   DefineVariable  PlaintextChain,     SDLL_SENTINEL,    {NULL, NULL}  ;Decrypted data chain (TLS only)
   DefineVariable  pData,              POINTER,          NULL  ;-> Data managed by the protocol
-  DefineVariable  dDisconnectError,   DWORD,            0     ;Error-Code f¸r async OnDisconnected
-  DefineVariable  dDisconnectDirection, DWORD,          0     ;Direction f¸r async OnDisconnected (SD_xxx)
+  DefineVariable  dDisconnectError,   DWORD,            0     ;Error-Code fùr async OnDisconnected
+  DefineVariable  dDisconnectDirection, DWORD,          0     ;Direction fùr async OnDisconnected (SD_xxx)
   DefineVariable  CritSect,           CRITICAL_SECTION, {}
   DefineVariable  wName,              CHRW,             28 dup(?) ;Used for DebugCenter Wnd Caption
 ObjectEnd
@@ -528,6 +529,7 @@ Object NetComProtocol, NetComProtocolID, Primer
   VirtualMethod   OnError,            $ObjPtr(NetComConnection), PIOJOB, DWORD
   VirtualMethod   OnHandshakeComplete,$ObjPtr(NetComConnection)
   VirtualMethod   OnHandshakeFailed,  $ObjPtr(NetComConnection), DWORD  ;dErrorCode
+  VirtualMethod   OnConfigureTLS,     $ObjPtr(NetComConnection)         ;Return: xax -> TLS_Connection_Config or NULL
   VirtualMethod   OnTimeouted,        $ObjPtr(NetComConnection)
   VirtualMethod   ProcessData,        $ObjPtr(NetComConnection), DWORD ;-> NetComConnection, Index
   VirtualMethod   Release,            $ObjPtr(NetComConnection)
@@ -791,7 +793,7 @@ DbgConnection macro pConnection:req, InfoText, Dest
     endif
 
     mov xdi, r15
-    WriteFA xdi, "Connection = ¶HXh", xbx
+    WriteFA xdi, "Connection = ùHXh", xbx
     invoke DbgOutTextA, r15, DBG_COLOR_FORE_CONNECTION, DBG_COLOR_BACK_CONNECTION, \
                         DBG_EFFECT_NEWLINE, ??DbgDstWnd
 
@@ -810,26 +812,26 @@ DbgConnection macro pConnection:req, InfoText, Dest
     invoke DbgOutTextA, r15, DBG_COLOR_FORE_CONNECTION, DBG_COLOR_BACK_CONNECTION, DBG_EFFECT_NEWLINE, ??DbgDstWnd
 
     mov xdi, r15
-    WriteFA xdi, "Pending IO-Jobs = ¶UD", [xbx].$Obj(NetComConnection).dPendingIOJobs
+    WriteFA xdi, "Pending IO-Jobs = ùUD", [xbx].$Obj(NetComConnection).dPendingIOJobs
     invoke DbgOutTextA, r15, DBG_COLOR_FORE_CONNECTION, DBG_COLOR_BACK_CONNECTION, \
                         DBG_EFFECT_NEWLINE, ??DbgDstWnd
 
     mov xdi, r15
-    WriteFA xdi, "Completed IO-Jobs = ¶UD", [xbx].$Obj(NetComConnection).dCompletedIOJobs
+    WriteFA xdi, "Completed IO-Jobs = ùUD", [xbx].$Obj(NetComConnection).dCompletedIOJobs
     invoke DbgOutTextA, r15, DBG_COLOR_FORE_CONNECTION, DBG_COLOR_BACK_CONNECTION, \
                         DBG_EFFECT_NEWLINE, ??DbgDstWnd
 ;    mov xdi, r15
-;    WriteFA xdi, "Receive last time = ¶UD seconds", [xbx].$Obj(NetComConnection).dRcvLstElpsdTime
+;    WriteFA xdi, "Receive last time = ùUD seconds", [xbx].$Obj(NetComConnection).dRcvLstElpsdTime
 ;    invoke DbgOutTextA, r15, DBG_COLOR_FORE_CONNECTION, DBG_COLOR_BACK_CONNECTION, \
 ;                        DBG_EFFECT_NEWLINE, ??DbgDstWnd
 ;
 ;    mov xdi, r15
-;    WriteFA xdi, "Protocol = ¶HXh", [xbx].$Obj(NetComConnection).pProtocol
+;    WriteFA xdi, "Protocol = ùHXh", [xbx].$Obj(NetComConnection).pProtocol
 ;    invoke DbgOutTextA, r15, DBG_COLOR_FORE_CONNECTION, DBG_COLOR_BACK_CONNECTION, \
 ;                        DBG_EFFECT_NEWLINE, ??DbgDstWnd
 
     mov xdi, r15
-    WriteFA xdi, "Socket Handle = ¶HX ", [xbx].$Obj(NetComConnection).hSocket
+    WriteFA xdi, "Socket Handle = ùHX ", [xbx].$Obj(NetComConnection).hSocket
     invoke DbgOutTextA, r15, DBG_COLOR_FORE_CONNECTION, DBG_COLOR_BACK_CONNECTION, \
                         DBG_EFFECT_NEWLINE, ??DbgDstWnd
 
@@ -850,7 +852,9 @@ endm
 
 ; ==================================================================================================
 
+include TLS_Connection_Config.inc   ;Immutable TLS configuration container
 include TLS_Context.inc             ;Abstract TLS base class (required by NetComConnection)
+include TLS_CertValidator.inc       ;Abstract certificate validator base class
 include NetComAddrCollection.inc    ;Collection for handling of NETCOMADDR structures
 include NetComProtocol.inc          ;Base object for handling of Network Events
 include NetComIOJobPool.inc         ;Object for recycling of NetComIOJob objects
@@ -974,39 +978,39 @@ endif
 ;  -----------                          -----------
 ;
 ;  [CLOSED]                             [CLOSED]
-;     ¶                                    ¶
-;     ¶ socket()                           ¶ socket()
-;     v                                    ¶ bind()
-;  [CREATED]                               ¶ listen()
-;     ¶                                    V
-;     ¶ Associate with IOCP             [LISTENING]
-;     v                                    ¶
-;  [IOCP-BOUND]                            ¶ Associate listen socket with IOCP
-;     ¶                                    V
-;     ¶ ConnectEx()                     [ACCEPTING]
-;     ¶  (pending)                         ¶
-;     v                                    ¶ AcceptEx()
-;  [CONNECTING]                            ¶  (pending)
-;     ¶                                    V
-;     ¶ IOCP completion                 [ACCEPTED]
-;     ¶  (success)                         ¶
-;     V                                    ¶ IOCP completion
-;  [CONNECTED]                             ¶
-;     ¶                                    ¶ setsockopt(SO_UPDATE_ACCEPT_CONTEXT)
-;     ¶ Post WSARecv()                     V
-;     ¶ Post WSASend()                  [CONNECTED]
-;     V                                    ¶
-;  [ACTIVE I/O]                            ¶ Post WSARecv()
-;     ¶                                    ¶ Post WSASend()
-;     ¶ shutdown(SD_SEND)                  V
+;     ù                                    ù
+;     ù socket()                           ù socket()
+;     v                                    ù bind()
+;  [CREATED]                               ù listen()
+;     ù                                    V
+;     ù Associate with IOCP             [LISTENING]
+;     v                                    ù
+;  [IOCP-BOUND]                            ù Associate listen socket with IOCP
+;     ù                                    V
+;     ù ConnectEx()                     [ACCEPTING]
+;     ù  (pending)                         ù
+;     v                                    ù AcceptEx()
+;  [CONNECTING]                            ù  (pending)
+;     ù                                    V
+;     ù IOCP completion                 [ACCEPTED]
+;     ù  (success)                         ù
+;     V                                    ù IOCP completion
+;  [CONNECTED]                             ù
+;     ù                                    ù setsockopt(SO_UPDATE_ACCEPT_CONTEXT)
+;     ù Post WSARecv()                     V
+;     ù Post WSASend()                  [CONNECTED]
+;     V                                    ù
+;  [ACTIVE I/O]                            ù Post WSARecv()
+;     ù                                    ù Post WSASend()
+;     ù shutdown(SD_SEND)                  V
 ;     V                                 [ACTIVE I/O]
-;  [HALF-CLOSED]                           ¶
-;     ¶                                    ¶ recv == 0
-;     ¶ recv returns 0                     V
+;  [HALF-CLOSED]                           ù
+;     ù                                    ù recv == 0
+;     ù recv returns 0                     V
 ;     V                                 [PEER-CLOSED]
-;  [CLOSING]                               ¶
-;     ¶                                    ¶ closesocket()
-;     ¶ closesocket()                      ¶
+;  [CLOSING]                               ù
+;     ù                                    ù closesocket()
+;     ù closesocket()                      ù
 ;     V                                    V
 ;  [CLOSED]                             [CLOSED]
 ;

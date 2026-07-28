@@ -258,6 +258,19 @@ Method NetComProtocol.OnHandshakeFailed,, pConnection:$ObjPtr(NetComConnection),
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
+; Method:     NetComProtocol.OnConfigureTLS
+; Purpose:    Called synchronously before the TLS handshake starts (both client and server side).
+;             Override in derived classes to return a TLS_Connection_Config object that will be
+;             applied to the connection's TLS_Context before StartClientHandshake/StartServerHandshake.
+; Arguments:  Arg1: -> NetComConnection.
+; Return:     xax -> TLS_Connection_Config or NULL (NULL = use current TLS_Context defaults).
+
+Method NetComProtocol.OnConfigureTLS,, pConnection:$ObjPtr(NetComConnection)
+  ANNOTATION use:pConnection
+  xor eax, eax                                         ;NULL = no explicit config
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
 ; Method:     NetComProtocol.ProcessData
 ; Purpose:    A client has finished sending us data, now we have to do something with that data.
 ; Arguments:  Arg1: -> NetComConnection.

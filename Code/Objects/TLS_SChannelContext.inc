@@ -398,6 +398,10 @@ Method TLS_SChannelContext.Init, uses xsi, pOwner:POINTER
   ; Reset client/server mode and connection pointer
   mov [xsi].bIsClient, FALSE
   mov [xsi].pConnection, NULL
+
+  ; Set default certificate validator (can be overridden via SetCertValidator)
+  lea xax, $ObjTmpl(TLS_DefaultCertValidator)
+  mov [xsi].pCertValidator, xax
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -881,7 +885,7 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   invoke InitializeSecurityContext, \
          xbx, \                               ; phCredential
          xdi, \                               ; phContext (existing context for continuation)
-         NULL, \                              ; pszTargetName
+         [xsi].pTargetName, \                 ; pszTargetName (hostname for SNI)
          TLS_CLIENT_ISC_FLAGS or ISC_REQ_ALLOCATE_MEMORY, \ ; fContextReq
          0, \                                 ; Reserved1
          0, \                                 ; TargetDataRep
@@ -1421,7 +1425,7 @@ Method TLS_SChannelContext.StartClientHandshake, uses xbx xdi xsi, pConnection:P
   invoke InitializeSecurityContext, \
          xbx, \                               ; phCredential
          NULL, \                              ; phContext (NULL for first call)
-         NULL, \                              ; pszTargetName (NULL - no server name validation here)
+         [xsi].pTargetName, \                 ; pszTargetName (hostname for SNI, or NULL)
          TLS_CLIENT_ISC_FLAGS or ISC_REQ_ALLOCATE_MEMORY, \ ; fContextReq
          0, \                                 ; Reserved1
          0, \                                 ; TargetDataRep (not used with stream)

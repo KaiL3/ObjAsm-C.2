@@ -28,7 +28,6 @@ Object TLS_DefaultCertValidator, TLS_DefaultCertValidatorID, TLS_CertValidator
   RedefineMethod  Validate,           POINTER         ; pCertContext -> HRESULT in eax
 ObjectEnd
 
-
 ; ==================================================================================================
 
 if IMPLEMENT
@@ -36,29 +35,6 @@ if IMPLEMENT
 ; ==================================================================================================
 ;    TLS_DefaultCertValidator implementation
 ; ==================================================================================================
-
-; --------------------------------------------------------------------------------------------------
-; CERT_E_xxx error constants (defined here to avoid dependency issues if COM_Errors.inc
-; is not included in the project). These match the standard Windows HRESULT values.
-
-ifndef CERT_E_EXPIRED
-  CERT_E_EXPIRED          equ 800B0101h
-endif
-ifndef CERT_E_UNTRUSTEDROOT
-  CERT_E_UNTRUSTEDROOT    equ 800B0109h
-endif
-ifndef CERT_E_CN_NO_MATCH
-  CERT_E_CN_NO_MATCH      equ 800B010Fh
-endif
-ifndef CERT_TRUST_IS_NOT_TIME_VALID
-  CERT_TRUST_IS_NOT_TIME_VALID       equ 00000001h
-endif
-ifndef CERT_TRUST_IS_UNTRUSTED_ROOT
-  CERT_TRUST_IS_UNTRUSTED_ROOT       equ 00000020h
-endif
-ifndef CERT_TRUST_INVALID_NAME_CONSTRAINT
-  CERT_TRUST_INVALID_NAME_CONSTRAINT equ 00000020h
-endif
 
 ; --------------------------------------------------------------------------------------------------
 ; Method:     TLS_DefaultCertValidator.Validate

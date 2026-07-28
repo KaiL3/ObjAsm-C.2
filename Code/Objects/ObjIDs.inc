@@ -439,6 +439,7 @@ TLS_ServerCertProviderID          equ     0000012114
 TLS_DefaultCertValidatorID        equ     0000012115
 TLS_DefaultClientCertProviderID   equ     0000012116
 TLS_DefaultServerCertProviderID   equ     0000012117
+TLS_Connection_ConfigID           equ     0000012118
 
 ;ACE
 AsmDevEnvID                       equ     0000012200

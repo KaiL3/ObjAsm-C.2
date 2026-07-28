@@ -112,6 +112,7 @@ Object TLS_Context, TLS_ContextID, Primer
   VirtualMethod     SetServerCertProvider,  POINTER       ; pTLS_ServerCertProvider
   VirtualMethod     SetAllowedProtocols,    DWORD         ; dProtocolBitmask
   VirtualMethod     SetAllowedCipherSuites, POINTER, DWORD  ; pAlgIDArray, dCount
+  VirtualMethod     SetTargetName,          POINTER       ; pszTargetName (ANSI, for SNI + cert validation)
   VirtualMethod     GetNegotiatedProtocol                 ; Return in eax
   VirtualMethod     GetNegotiatedCipherSuite              ; Return in eax
 
@@ -123,6 +124,7 @@ Object TLS_Context, TLS_ContextID, Primer
   DefineVariable    pAllowedCipherSuites, POINTER,  NULL
   DefineVariable    dCipherSuiteCount,    DWORD,    0
   DefineVariable    dMaxMessageSize,      DWORD,    0     ;Max plaintext bytes per TLS record (set after handshake)
+  DefineVariable    pTargetName,          POINTER,  NULL  ;Server hostname for SNI (ANSI string, caller-owned)
 
   ; Reassembly buffer (managed by derived class, accessed by NetComConnection)
   DefineVariable    pReassemblyBuffer,    POINTER,  NULL
@@ -235,6 +237,19 @@ MethodEnd
 
 Method TLS_Context.GetNegotiatedCipherSuite
   xor eax, eax
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_Context.SetTargetName
+; Purpose:    Sets the target server hostname for SNI (Server Name Indication) and
+;             certificate validation. The pointer must remain valid for the lifetime
+;             of the TLS session (caller-owned string, not copied).
+; Arguments:  Arg1: -> ANSI hostname string (or NULL to disable SNI).
+; Return:     Nothing.
+
+Method TLS_Context.SetTargetName, uses xsi, pszName:POINTER
+  SetObject xsi
+  m2m [xsi].pTargetName, pszName, xax
 MethodEnd
 
 endif

@@ -38,6 +38,12 @@ Method NetComConnection.Admit, uses xsi, dDecision:DWORD
       ;This must happen BEFORE QueueReceive, so that when the first client handshake
       ;token arrives, the state machine in OnReceived routes it to ProcessHandshakeData.
       .if [xsi].pTLSContext != NULL
+        ; OnConfigureTLS: Let protocol provide TLS configuration before handshake
+        OCall [xsi].pProtocol::NetComProtocol.OnConfigureTLS, xsi
+        .if xax != NULL
+          OCall xsi.ApplyTLSConfig, xax
+        .endif
+
         OCall [xsi].pTLSContext::TLS_Context.StartServerHandshake, xsi
       .endif
 
@@ -121,7 +127,7 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
         OCall [xsi].pTLSContext::TLS_Context.Shutdown, xsi
         BitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
         invoke GetSystemTimeAsFileTime, addr [xsi].LastTime
-        ; Kein TCP shutdown hier — warten auf Peer-Antwort oder Timeout
+        ; Kein TCP shutdown hier  warten auf Peer-Antwort oder Timeout
         ExitMethod
       .endif
     .endif
@@ -434,16 +440,22 @@ Method NetComConnection.OnConnected, uses xsi, pIOJob:PIOJOB
 ;  DbgNetComAddrIPV4 [xsi].RemoteAddr, "NetComConnection.OnConnected - RemoteAddr", addr [xsi].wName
 
   .if [xsi].pTLSContext != NULL
+    ; OnConfigureTLS: Let protocol provide TLS configuration before handshake
+    OCall [xsi].pProtocol::NetComProtocol.OnConfigureTLS, xsi
+    .if xax != NULL
+      OCall xsi.ApplyTLSConfig, xax
+    .endif
+
     ; (1) TLS-Handshake initiieren (Context + Client Hello)
     OCall [xsi].pTLSContext::TLS_Context.StartClientHandshake, xsi
 
-    ; (2) Socket empfangsbereit machen (single-IOJob mode — nur ein ausstehender Receive)
+    ; (2) Socket empfangsbereit machen (single-IOJob mode  nur ein ausstehender Receive)
     OCall xsi.QueueReceive
 
     ; (3) Anwendung informieren
     OCall [xsi].pProtocol::NetComProtocol.OnConnected, xsi
   .else
-    ; Kein TLS — normaler Ablauf
+    ; Kein TLS  normaler Ablauf
     OCall [xsi].pProtocol::NetComProtocol.OnConnected, xsi
   .endif
 MethodEnd
@@ -462,7 +474,7 @@ Method NetComConnection.OnError, uses xbx xdi xsi, pIOJob:PIOJOB, dError:DWORD
   mov xbx, pIOJob
   mov xdi, [xsi].pOwner                                 ;xdi -> NetComConnectionPool
 
-  ; === Spurious Errors nach Close unterdrücken ===
+  ; === Spurious Errors nach Close unterdrcken ===
   .ifBitSet [xsi].dFlags, NCC_CLOSED
     movzx eax, [xbx].IOJOB.wOperation
     .if eax == IOJOB_RECV
@@ -1086,7 +1098,7 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
       ; No plaintext yet - check if peer sent close_notify
       OCall pTLSCtx::TLS_Context.GetState
       .if eax == TLS_STATE_SHUTDOWN
-        ; Respond with own close_notify (RFC 8446 §6.1)
+        ; Respond with own close_notify (RFC 8446 6.1)
         OCall pTLSCtx::TLS_Context.Shutdown, xsi
         invoke shutdown, [xsi].hSocket, SD_SEND
         BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
@@ -1224,6 +1236,58 @@ Method NetComConnection.QueueSendTLS, uses xbx xdi xsi, pData:POINTER, dSize:DWO
 @@Done:
   mov eax, dSize
   sub eax, edi
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComConnection.ApplyTLSConfig
+; Purpose:    Applies a TLS_Connection_Config to this connection's pTLSContext.
+;             Called synchronously from OnConnected (client) or Admit (server) before the
+;             TLS handshake starts. Transfers all non-NULL config values to the TLS_Context.
+; Arguments:  Arg1: -> TLS_Connection_Config object.
+; Return:     Nothing.
+
+Method NetComConnection.ApplyTLSConfig, uses xbx xsi, pConfig:POINTER
+  local pAlgs:POINTER, dCount:DWORD
+
+  SetObject xsi
+  mov xbx, pConfig
+  .if xbx == NULL
+    ExitMethod
+  .endif
+
+  ; TargetName (SNI)
+  OCall xbx::TLS_Connection_Config.GetTargetName
+  .if xax != NULL
+    OCall [xsi].pTLSContext::TLS_Context.SetTargetName, xax
+  .endif
+
+  ; Allowed Protocols
+  OCall xbx::TLS_Connection_Config.GetAllowedProtocols
+  OCall [xsi].pTLSContext::TLS_Context.SetAllowedProtocols, eax
+
+  ; CertValidator
+  OCall xbx::TLS_Connection_Config.GetCertValidator
+  .if xax != NULL
+    OCall [xsi].pTLSContext::TLS_Context.SetCertValidator, xax
+  .endif
+
+  ; ServerCertProvider
+  OCall xbx::TLS_Connection_Config.GetServerCertProvider
+  .if xax != NULL
+    OCall [xsi].pTLSContext::TLS_Context.SetServerCertProvider, xax
+  .endif
+
+  ; ClientCertProvider
+  OCall xbx::TLS_Connection_Config.GetClientCertProvider
+  .if xax != NULL
+    OCall [xsi].pTLSContext::TLS_Context.SetClientCertProvider, xax
+  .endif
+
+  ; Cipher Suites
+  OCall xbx::TLS_Connection_Config.GetCipherSuites, addr pAlgs, addr dCount
+  .if pAlgs != NULL
+    OCall [xsi].pTLSContext::TLS_Context.SetAllowedCipherSuites, pAlgs, dCount
+  .endif
 MethodEnd
 
 endif
