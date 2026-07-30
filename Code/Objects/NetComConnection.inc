@@ -488,6 +488,24 @@ Method NetComConnection.OnError, uses xbx xdi xsi, pIOJob:PIOJOB, dError:DWORD
   .endif
   ; === End Guard ===
 
+  ; === Spurious Errors nach TLS Shutdown unterdrùcken ===
+  ; Wenn der Socket bereits per shutdown(SD_SEND) halb-geschlossen ist,
+  ; erzeugen pending IOJobs WSAEESHUTDOWN (10058) oder WSAECONNRESET.
+  ; Diese sind erwartet und werden nicht an die Protocol-Schicht gemeldet.
+  .ifBitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
+    .if [xsi].pTLSContext != NULL
+      movzx eax, [xbx].IOJOB.wOperation
+      .if eax == IOJOB_RECV
+        mov xcx, pIOJob
+        lea xax, [xcx].IOJOB.pNextItem
+        SDLL_Remove xax, xcx, xdx
+      .endif
+      OCall [xdi].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, xbx
+      ExitMethod
+    .endif
+  .endif
+  ; === End TLS Shutdown Guard ===
+
   movzx eax, [xbx].IOJOB.wOperation
 ;  DbgDec eax, "NetComConnection.OnError Operation";, addr [xsi].wName
   .if eax == IOJOB_ACCEPT
@@ -577,8 +595,32 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
         invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
                0, COMPLETION_KEY_DISCONNECTED, xsi
       .endif
+
+    .elseif [xsi].pTLSContext != NULL
+      ; TLS Responder-Pfad: FIN kam nach close_notify-Verarbeitung.
+      ; Wir haben bereits unsere close_notify-Antwort gesendet (NCC_SHUTDOWN_SND_LOCAL).
+      ; Kein weiterer Disconnect nˆtig ó Socket wird ¸ber QueueDestroy abgebaut.
+      .ifBitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
+        ; Shutdown-Sequenz bereits komplett ó nichts weiter tun
+      .else
+        ; FIN ohne vorherige close_notify (truncated close) ó sauber beenden
+        .ifBitClr [xsi].dFlags, NCC_CLOSED
+          invoke shutdown, [xsi].hSocket, SD_SEND
+          BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
+        .endif
+        .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
+          BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
+          mov [xsi].dDisconnectError, NO_ERROR
+          mov [xsi].dDisconnectDirection, SD_RECEIVE
+          mov xcx, [xsi].pOwner
+          mov xax, [xcx].$Obj(NetComConnectionPool).pOwner
+          invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
+                 0, COMPLETION_KEY_DISCONNECTED, xsi
+        .endif
+      .endif
+
     .else
-      ; Normaler FIN-Pfad (non-TLS oder nicht von uns initiiert)
+      ; Normaler FIN-Pfad (non-TLS)
       .ifBitClr [xsi].dFlags, NCC_CLOSED
         OCall xsi.Disconnect, SD_RECEIVE                  ;Local shutdown receive
       .endif
@@ -978,17 +1020,13 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
   OCall pTLSCtx::TLS_Context.GetState
   DbgDec eax, "TLS State"
 
-  .if eax == TLS_STATE_HANDSHAKE || eax == TLS_STATE_SHUTDOWN
-    ; --- Handshake / Shutdown ---
-    ; Pass accumulated buffer to ProcessHandshakeData
+  .if eax == TLS_STATE_SHUTDOWN
+    ; --- TLS Shutdown in progress ---
+    ; Peer's close_notify response received (or we responded to peer's close_notify).
+    ; ISC/ASC cannot process shutdown records ó do NOT call ProcessHandshakeData.
+    ; Just clear the reassembly buffer and complete the TCP-level disconnect.
     mov xbx, pTLSCtx
-    mov eax, [xbx].$Obj(TLS_Context).dReassemblyUsed
-    .if eax == 0
-      jmp @@Done                                        ;No data to process
-    .endif
-    OCall pTLSCtx::TLS_Context.ProcessHandshakeData, \
-          [xbx].$Obj(TLS_Context).pReassemblyBuffer, \
-          [xbx].$Obj(TLS_Context).dReassemblyUsed, xsi
+    mov [xbx].$Obj(TLS_Context).dReassemblyUsed, 0
 
     ; If WE initiated the TLS Shutdown, complete the TCP-level disconnect
     .ifBitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
@@ -1005,6 +1043,18 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
                0, COMPLETION_KEY_DISCONNECTED, xsi
       .endif
     .endif
+
+  .elseif eax == TLS_STATE_HANDSHAKE
+    ; --- Handshake in progress ---
+    ; Pass accumulated buffer to ProcessHandshakeData
+    mov xbx, pTLSCtx
+    mov eax, [xbx].$Obj(TLS_Context).dReassemblyUsed
+    .if eax == 0
+      jmp @@Done                                        ;No data to process
+    .endif
+    OCall pTLSCtx::TLS_Context.ProcessHandshakeData, \
+          [xbx].$Obj(TLS_Context).pReassemblyBuffer, \
+          [xbx].$Obj(TLS_Context).dReassemblyUsed, xsi
 
   .elseif eax == TLS_STATE_DATA
     ; --- Decrypt ---
@@ -1098,8 +1148,11 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
       ; No plaintext yet - check if peer sent close_notify
       OCall pTLSCtx::TLS_Context.GetState
       .if eax == TLS_STATE_SHUTDOWN
-        ; Respond with own close_notify (RFC 8446 ù6.1)
-        OCall pTLSCtx::TLS_Context.Shutdown, xsi
+        ; Peer sent close_notify ó respond unless peer already sent FIN (half-close)
+        .ifBitClr [xsi].dFlags, NCC_SHUTDOWN_SND_REMOTE
+          ; Peer-Socket noch offen ó eigene close_notify senden (RFC 8446)
+          OCall pTLSCtx::TLS_Context.Shutdown, xsi
+        .endif
         invoke shutdown, [xsi].hSocket, SD_SEND
         BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
         .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
