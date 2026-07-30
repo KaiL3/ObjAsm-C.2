@@ -69,7 +69,7 @@ endif
 Object TLS_DefaultServerCertProvider, TLS_DefaultServerCertProviderID, TLS_ServerCertProvider
   RedefineMethod    Init,               POINTER         ; -> Owner
   RedefineMethod    Done
-  RedefineMethod    GetServerCert                       ; Return in xax: -> CERT_CONTEXT or NULL
+  RedefineMethod    GetServerCert, POINTER, DWORD   ; pSNIHostname, dSNILen (ignored in default impl)
 
   VirtualMethod     SetSearchCriteria,  DWORD, POINTER  ; dSearchType, pSearchValue
   VirtualMethod     SetStoreName,       POINTER         ; pStoreName (String)
@@ -154,11 +154,14 @@ MethodEnd
 ;             CERT_CONTEXT when it is no longer needed.
 ;             The certificate store is opened and closed within this method.
 
-Method TLS_DefaultServerCertProvider.GetServerCert, uses xbx xdi xsi
+Method TLS_DefaultServerCertProvider.GetServerCert, uses xbx xdi xsi, pSNIHostname:POINTER, dSNILen:DWORD
   local hStore:HANDLE, dFindType:DWORD, hKey:XWORD, dKeySpec:DWORD, bCallerFree:DWORD
   local pCertSerial:POINTER, pSearchSerial:POINTER, dSerialSize:DWORD
 
   SetObject xsi
+  .if pSNIHostname != NULL
+    DbgMem pSNIHostname, dSNILen, "SNI"
+  .endif
   xor eax, eax
   mov xbx, xax                                       ;xbx = NULL (default return value)
 

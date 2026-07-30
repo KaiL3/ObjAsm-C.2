@@ -20,8 +20,11 @@
 ;             for the server certificate, or NULL if no certificate is available.
 ; Notes:      This is a Strategy-Pattern interface. The TLS_SChannelContext calls GetServerCert
 ;             during server-side handshake initialization to obtain the server certificate.
+;             GetServerCert receives the SNI hostname extracted from the ClientHello
+;             (or NULL/0 if no SNI was present). Implementations can use this to select
+;             the appropriate certificate for multi-vhost servers.
 
 Object TLS_ServerCertProvider, TLS_ServerCertProviderID, Primer
-  VirtualAbstract   GetServerCert         ; Return in xax: -> CERT_CONTEXT or NULL
+  VirtualAbstract   GetServerCert, POINTER, DWORD  ; pSNIHostname (ANSI, NULL if no SNI), dSNILen
 ObjectEnd
 

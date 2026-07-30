@@ -177,6 +177,11 @@ ifndef SCHANNEL_SHUTDOWN
   SCHANNEL_SHUTDOWN           equ   1
 endif
 
+; SslGetServerIdentity prototype (SNI extraction from ClientHello)
+ifndef __SCHANNEL_INC__
+  SslGetServerIdentity proto WIN_STD_CALL_CONV :ptr BYTE, :DWORD, :ptr ptr BYTE, :ptr DWORD, :DWORD
+endif
+
 ; Security status codes for DecryptMessage / Handshake
 ifndef SEC_E_OK
   SEC_E_OK                    equ   00000000h
@@ -307,7 +312,7 @@ Object TLS_SChannelContext, TLS_SChannelContextID, TLS_Context
   RedefineMethod  Shutdown,           POINTER
   RedefineMethod  GetState
 
-  VirtualMethod   InitCredentials,    DWORD           ; dUsage (Client/Server)
+  VirtualMethod   InitCredentials,    DWORD, POINTER, DWORD  ; dUsage, pSNIHostname, dSNILen
   VirtualMethod   AllocateBuffers
   VirtualMethod   FreeBuffers
   VirtualMethod   TranslateError,     DWORD           ; dSecurityStatus -> xax = -> error string
@@ -843,6 +848,8 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   local pCertContext:POINTER
   local SchannelCred:SCHANNEL_CRED
   local tsCredExpiry:TimeStamp
+  local pSNIHostname:POINTER
+  local dSNILen:DWORD
 
   SetObject xsi
 
@@ -1155,6 +1162,25 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   ; ===========================================================================
 @@ServerPath:
 
+  ; --- SNI Extraction and Credential Initialization (first call only) ---
+  .if [xsi].bCredentialValid == FALSE
+    ; Extract SNI hostname from ClientHello using SslGetServerIdentity
+    mov pSNIHostname, NULL
+    mov dSNILen, 0
+    invoke SslGetServerIdentity, pData, dDataSize, addr pSNIHostname, addr dSNILen, 0
+    ; SEC_E_OK = SNI found, pSNIHostname points INTO pData buffer (no alloc needed)
+    ; Any other status = no SNI, pSNIHostname stays NULL
+
+    ; Initialize server credentials with SNI info for certificate selection
+    OCall xsi.InitCredentials, SECPKG_CRED_INBOUND, pSNIHostname, dSNILen
+    .if eax != OBJ_OK
+      ; Credential initialization failed
+      mov [xsi].dLastError, eax
+      mov [xsi].dState, TLS_STATE_ERROR
+      jmp @@ServerHandshakeFailed
+    .endif
+  .endif
+
 @@RetryASC:
   ; --- Build input SecBufferDesc for AcceptSecurityContext ---
   mov InBufferDesc.ulVersion, SECBUFFER_VERSION
@@ -1399,7 +1425,7 @@ Method TLS_SChannelContext.StartClientHandshake, uses xbx xdi xsi, pConnection:P
   mov [xsi].dState, TLS_STATE_HANDSHAKE
 
   ; Initialize client credentials (SECPKG_CRED_OUTBOUND, anonymous - no cert)
-  OCall xsi.InitCredentials, SECPKG_CRED_OUTBOUND
+  OCall xsi.InitCredentials, SECPKG_CRED_OUTBOUND, NULL, 0
   .if eax != OBJ_OK
     ; Credential initialization failed
     mov [xsi].dState, TLS_STATE_ERROR
@@ -1494,24 +1520,9 @@ Method TLS_SChannelContext.StartServerHandshake, uses xbx xsi, pConnection:POINT
   ; Transition state: NONE → HANDSHAKE
   mov [xsi].dState, TLS_STATE_HANDSHAKE
 
-  ; Initialize server credentials (SECPKG_CRED_INBOUND)
-  ; This will obtain the server certificate from TLS_ServerCertProvider,
-  ; verify private key, and call AcquireCredentialsHandle
-  OCall xsi.InitCredentials, SECPKG_CRED_INBOUND
-  .if eax != OBJ_OK
-    ; Credential initialization failed (TLS_SERVER_CERT_REQUIRED,
-    ; TLS_SERVER_CERT_NOT_PROVIDED, or TLS_CREDENTIAL_ERROR)
-    mov [xsi].dLastError, eax
-    mov [xsi].dState, TLS_STATE_ERROR
-
-    ; Notify protocol of handshake failure
-    mov xbx, pConnection
-    mov xbx, [xbx].$Obj(NetComConnection).pProtocol
-    OCall xbx::NetComProtocol.OnError, pConnection, NULL, TLS_HANDSHAKE_FAILED
-
-    mov eax, TLS_HANDSHAKE_FAILED
-    jmp @@Exit
-  .endif
+  ; Initialize server credentials: DEFERRED to ProcessHandshakeData (SNI support).
+  ; Credentials will be created after extracting SNI from the ClientHello,
+  ; allowing GetServerCert to receive the hostname for multi-vhost selection.
 
   ; Allocate reassembly buffer early for handshake data accumulation
   .if [xsi].pReassemblyBuffer == NULL
@@ -1663,7 +1674,7 @@ MethodEnd
 ; Return:     eax = OBJ_OK on success, TLS_SERVER_CERT_REQUIRED / TLS_SERVER_CERT_NOT_PROVIDED /
 ;             TLS_CREDENTIAL_ERROR on failure.
 
-Method TLS_SChannelContext.InitCredentials, uses xbx xsi, dUsage:DWORD
+Method TLS_SChannelContext.InitCredentials, uses xbx xsi, dUsage:DWORD, pSNIHostname:POINTER, dSNILen:DWORD
   local SchannelCred:SCHANNEL_CRED
   local pCertContext:POINTER
   local tsExpiry:TimeStamp
@@ -1695,8 +1706,8 @@ Method TLS_SChannelContext.InitCredentials, uses xbx xsi, dUsage:DWORD
       jmp @@Exit
     .endif
 
-    ; Call GetServerCert on the provider
-    OCall [xsi].pServerCertProvider::TLS_ServerCertProvider.GetServerCert
+    ; Call GetServerCert on the provider (pass SNI hostname for multi-vhost selection)
+    OCall [xsi].pServerCertProvider::TLS_ServerCertProvider.GetServerCert, pSNIHostname, dSNILen
     .if xax == NULL
       mov eax, TLS_SERVER_CERT_NOT_PROVIDED
       jmp @@Exit
