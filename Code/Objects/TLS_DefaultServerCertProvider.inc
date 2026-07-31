@@ -15,44 +15,6 @@
 ;               - Initial release.
 ; ==================================================================================================
 
-
-; --------------------------------------------------------------------------------------------------
-; CertOpenStore / CertFindCertificateInStore constants (from wincrypt.h)
-; --------------------------------------------------------------------------------------------------
-
-ifndef CERT_STORE_PROV_SYSTEM
-  if TARGET_STR_TYPE eq STR_TYPE_WIDE
-    CERT_STORE_PROV_SYSTEM    equ   10    ; CERT_STORE_PROV_SYSTEM_W
-  else
-    CERT_STORE_PROV_SYSTEM    equ   9     ; CERT_STORE_PROV_SYSTEM_A
-  endif
-endif
-
-ifndef CERT_FIND_SUBJECT_STR
-  if TARGET_STR_TYPE eq STR_TYPE_WIDE
-    CERT_FIND_SUBJECT_STR     equ   000F0007h   ; CERT_FIND_SUBJECT_STR_W
-  else
-    CERT_FIND_SUBJECT_STR     equ   000F0004h   ; CERT_FIND_SUBJECT_STR_A
-  endif
-endif
-
-ifndef CERT_SYSTEM_STORE_LOCAL_MACHINE
-  CERT_SYSTEM_STORE_LOCAL_MACHINE equ 00020000h
-endif
-
-ifndef CRYPT_ACQUIRE_COMPARE_KEY_FLAG
-  CRYPT_ACQUIRE_COMPARE_KEY_FLAG  equ 00000010h
-endif
-
-ifndef CRYPT_ACQUIRE_SILENT_FLAG
-  CRYPT_ACQUIRE_SILENT_FLAG       equ 00000040h
-endif
-
-ifndef CERT_NCRYPT_KEY_SPEC
-  CERT_NCRYPT_KEY_SPEC            equ 0FFFFFFFFh
-endif
-
-
 ; --------------------------------------------------------------------------------------------------
 ; Object:     TLS_DefaultServerCertProvider
 ; Purpose:    Standard implementation of TLS_ServerCertProvider.

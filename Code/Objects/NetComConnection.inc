@@ -1164,6 +1164,17 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
           invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
                  0, COMPLETION_KEY_DISCONNECTED, xsi
         .endif
+
+      .elseif eax == TLS_STATE_HANDSHAKE
+        ; --- Renegotiation: Peer initiated a new handshake (TLS 1.2 only) ---
+        ; Decrypt returned SEC_I_RENEGOTIATE. EXTRA data may or may not be in the
+        ; reassembly buffer. Call ProcessHandshakeData in either case — ISC needs
+        ; to be called (even with 0 bytes input) to generate our ClientHello response.
+        mov xbx, pTLSCtx
+        OCall pTLSCtx::TLS_Context.ProcessHandshakeData, \
+              [xbx].$Obj(TLS_Context).pReassemblyBuffer, \
+              [xbx].$Obj(TLS_Context).dReassemblyUsed, xsi
+
       .endif
     .endif
 
