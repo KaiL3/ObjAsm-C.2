@@ -599,11 +599,11 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
     .elseif [xsi].pTLSContext != NULL
       ; TLS Responder-Pfad: FIN kam nach close_notify-Verarbeitung.
       ; Wir haben bereits unsere close_notify-Antwort gesendet (NCC_SHUTDOWN_SND_LOCAL).
-      ; Kein weiterer Disconnect nˆtig ó Socket wird ¸ber QueueDestroy abgebaut.
+      ; Kein weiterer Disconnect nùtig ù Socket wird ùber QueueDestroy abgebaut.
       .ifBitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
-        ; Shutdown-Sequenz bereits komplett ó nichts weiter tun
+        ; Shutdown-Sequenz bereits komplett ù nichts weiter tun
       .else
-        ; FIN ohne vorherige close_notify (truncated close) ó sauber beenden
+        ; FIN ohne vorherige close_notify (truncated close) ù sauber beenden
         .ifBitClr [xsi].dFlags, NCC_CLOSED
           invoke shutdown, [xsi].hSocket, SD_SEND
           BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
@@ -1023,7 +1023,7 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
   .if eax == TLS_STATE_SHUTDOWN
     ; --- TLS Shutdown in progress ---
     ; Peer's close_notify response received (or we responded to peer's close_notify).
-    ; ISC/ASC cannot process shutdown records ó do NOT call ProcessHandshakeData.
+    ; ISC/ASC cannot process shutdown records ù do NOT call ProcessHandshakeData.
     ; Just clear the reassembly buffer and complete the TCP-level disconnect.
     mov xbx, pTLSCtx
     mov [xbx].$Obj(TLS_Context).dReassemblyUsed, 0
@@ -1148,9 +1148,9 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
       ; No plaintext yet - check if peer sent close_notify
       OCall pTLSCtx::TLS_Context.GetState
       .if eax == TLS_STATE_SHUTDOWN
-        ; Peer sent close_notify ó respond unless peer already sent FIN (half-close)
+        ; Peer sent close_notify ù respond unless peer already sent FIN (half-close)
         .ifBitClr [xsi].dFlags, NCC_SHUTDOWN_SND_REMOTE
-          ; Peer-Socket noch offen ó eigene close_notify senden (RFC 8446)
+          ; Peer-Socket noch offen ù eigene close_notify senden (RFC 8446)
           OCall pTLSCtx::TLS_Context.Shutdown, xsi
         .endif
         invoke shutdown, [xsi].hSocket, SD_SEND
@@ -1168,7 +1168,7 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
       .elseif eax == TLS_STATE_HANDSHAKE
         ; --- Renegotiation: Peer initiated a new handshake (TLS 1.2 only) ---
         ; Decrypt returned SEC_I_RENEGOTIATE. EXTRA data may or may not be in the
-        ; reassembly buffer. Call ProcessHandshakeData in either case ó ISC needs
+        ; reassembly buffer. Call ProcessHandshakeData in either case ù ISC needs
         ; to be called (even with 0 bytes input) to generate our ClientHello response.
         mov xbx, pTLSCtx
         OCall pTLSCtx::TLS_Context.ProcessHandshakeData, \

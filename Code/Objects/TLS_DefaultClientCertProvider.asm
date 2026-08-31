@@ -3,7 +3,7 @@
 ; Author:     Kai Liebenau
 ; Version:    C.2.0
 ; Purpose:    ObjAsm compilation file for TLS_DefaultClientCertProvider object.
-; Notes:      Version C.1.0
+; Notes:      Version C.2.0
 ;             - Initial release.
 ; ==================================================================================================
 
