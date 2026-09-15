@@ -18,7 +18,7 @@
 ;             for mutual TLS authentication.
 ; Notes:      Virtual abstract method must be overridden by derived classes.
 
-Object TLS_ClientCertProvider, TLS_ClientCertProviderID, Primer
+Object TLS_ClientCertProvider, TLS_ClientCertProviderID, TLS_CertProvider
   VirtualAbstract   GetClientCert         ; Return in xax: -> CERT_CONTEXT or NULL
 ObjectEnd
 

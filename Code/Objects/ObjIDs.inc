@@ -431,6 +431,7 @@ NetComProtocolID                  equ     0000012106
 NetComSupervisorID                equ     0000012107
 NetComFileID                      equ     0000012108
 NetComFileEventsID                equ     0000012109
+TLS_CertProviderID                equ     0000012119
 TLS_ContextID                     equ     0000012110
 TLS_SChannelContextID             equ     0000012111
 TLS_CertValidatorID               equ     0000012112

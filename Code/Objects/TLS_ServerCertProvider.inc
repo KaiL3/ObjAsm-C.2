@@ -24,7 +24,7 @@
 ;             (or NULL/0 if no SNI was present). Implementations can use this to select
 ;             the appropriate certificate for multi-vhost servers.
 
-Object TLS_ServerCertProvider, TLS_ServerCertProviderID, Primer
+Object TLS_ServerCertProvider, TLS_ServerCertProviderID, TLS_CertProvider
   VirtualAbstract   GetServerCert, POINTER, DWORD  ; pSNIHostname (ANSI, NULL if no SNI), dSNILen
 ObjectEnd
 
