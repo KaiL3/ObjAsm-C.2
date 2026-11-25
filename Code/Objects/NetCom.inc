@@ -44,6 +44,11 @@
 ;               - NetComProtocol: dMaxRcvBuffered (receive limit per connection).
 ;               - NetComConnection: PauseReceive/ResumeReceive (receive flow control), PauseTime.
 ;               - NetComSupervisor: dRcvPauseTimeout.
+;               - NetComEngine.NewAcceptor: a failed NetComConnection.Init (e.g. Allocate) no
+;                 longer queues AcceptEx; NetComProtocol.Allocate failure contract documented.
+;               - NetComEngine.DiscardConnection: releases a connection without IO in flight
+;                 without posting OnDisconnected/OnClosed (ConnectTo error path).
+;               - NetComConnection.QueueConnect/QueueAccept: ConnectEx/AcceptEx BOOL result.
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -585,6 +590,7 @@ Object NetComEngine, NetComEngineID, Primer
   VirtualMethod   ConnectionsDisconnect
   VirtualMethod   ConnectionsDestroy
   VirtualMethod   ConnectTo,          $ObjPtr(NetComProtocol), PNETCOMADDR, PNETCOMADDR
+  StaticMethod    DiscardConnection,  $ObjPtr(NetComConnection)
   RedefineMethod  Done
   RedefineMethod  Init,               POINTER, POINTER, DWORD, DWORD, DWORD
   VirtualMethod   NewConnection,      $ObjPtr(NetComProtocol)

@@ -1,9 +1,16 @@
 ; ==================================================================================================
 ; Title:      NetComConnection.inc
 ; Author:     G. Friedrich
-; Version:    C.1.1
+; Version:    C.1.2
 ; Purpose:    ObjAsm support of NetComConnection objects.
-; Notes:      Version C.1.1, November 2026
+; Notes:      Version C.1.2, November 2026
+;               - Init: calls NetComProtocol.Release if the socket cannot be created and returns
+;                 the error code.
+;               - QueueConnect/QueueAccept: ConnectEx/AcceptEx return a BOOL; FALSE was always
+;                 taken as pending and TRUE as an error check of a stale WSAGetLastError.
+;               - QueueConnect: no OnError on failure, frees its IOJob and returns a defined error
+;                 code (bind error, out of memory).
+;             Version C.1.1, November 2026
 ;               - CheckRcvLimit: enforces NetComProtocol.dMaxRcvBuffered after each receive.
 ;               - PauseReceive/ResumeReceive: NCC_RCV_PAUSED is honoured by OnReceived and
 ;                 QueueReceive; Disconnect lifts a pause; QueueReceive keeps at most one
@@ -421,9 +428,12 @@ MethodEnd
 ; Arguments:  Arg1: -> Owner object (NetComConnectionPool).
 ;             Arg2: -> NetComProtocol or derived object.
 ; Return:     eax = Zero if succeeded, otherwise an error code.
+; Note:       On failure, Init has released what it allocated (NetComProtocol.Allocate failed or
+;             Release was called after a socket error). The caller must call Done and return the
+;             connection to the pool; nothing was queued on the IOCP.
 
 Method NetComConnection.Init, uses xsi, pOwner:POINTER, pProtocol:POINTER
-  local dOption:DWORD
+  local dOption:DWORD, dError:DWORD
 
   SetObject xsi
   ?mov xdx, pOwner
@@ -459,7 +469,10 @@ Method NetComConnection.Init, uses xsi, pOwner:POINTER, pProtocol:POINTER
       xor eax, eax
     .else
       invoke WSAGetLastError
+      mov dError, eax
       DbgOnSockError "NetComConnection.Init - Failed to create socket", eax,, addr [xsi].wName
+      OCall pProtocol::NetComProtocol.Release, xsi      ;Undo NetComProtocol.Allocate
+      mov eax, dError
     .endif
   .endif
 MethodEnd
@@ -900,11 +913,15 @@ Method NetComConnection.QueueAccept, uses xbx xdi xsi, pListener:PLISTENER
   invoke AcceptEx, [xcx].LISTENER.hSocket, [xsi].hSocket, [xdi].IOJOB.WSABuf.buf, 0, \
                    sizeof ACCEPT_DATA.LocalAddr, sizeof ACCEPT_DATA.RemoteAddr, \
                    addr dBytesReceived, xdi
-  .if eax != NO_ERROR                                   ;Did read IO complete synchronously?
-    invoke WSAGetLastError                              ;No, check if it is a pending state
+  ;AcceptEx returns a BOOL: TRUE = completed synchronously (the completion is posted anyway),
+  ;FALSE = pending or failed
+  .if eax == FALSE
+    invoke WSAGetLastError
     .if eax == ERROR_IO_PENDING
       xor eax, eax                                      ;Not an error
     .endif
+  .else
+    xor eax, eax
   .endif
 
   .if eax == 0
@@ -939,10 +956,12 @@ MethodEnd
 ; Arguments:  Arg1: -> Remote address.
 ;             Arg2: -> Local address. If NULL, not binding is performed.
 ; Return:     eax = Zero if succeeded, otherwise an error code.
+; Note:       On failure nothing is queued and OnError is not called. The caller must discard the
+;             connection with NetComEngine.DiscardConnection.
 
 Method NetComConnection.QueueConnect, uses xbx xdi xsi, pRemoteAddr:PNETCOMADDR, \
                                                         pLocalAddr:PNETCOMADDR
-  local dOption:DWORD
+  local dOption:DWORD, dError:DWORD
 
   SetObject xsi
   ;Here we can change the returning port
@@ -959,8 +978,10 @@ Method NetComConnection.QueueConnect, uses xbx xdi xsi, pRemoteAddr:PNETCOMADDR,
     invoke bind, [xsi].hSocket, pLocalAddr, sizeof NETCOMADDR
     .if eax == SOCKET_ERROR
       invoke WSAGetLastError
+      mov dError, eax
       DbgSockError "NetComConnection.QueueConnect - BIND result", eax,, addr [xsi].wName
       ;In this case, nothing is queued to the IOCP. ConnectEx would fail.
+      mov eax, dError
       ExitMethod
     .endif
     BitSet [xsi].dFlags, NCC_BOUND
@@ -973,6 +994,7 @@ Method NetComConnection.QueueConnect, uses xbx xdi xsi, pRemoteAddr:PNETCOMADDR,
   OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.NewItem, IOJOB_CONNECT
   .if xax == NULL
     OCall xsi.ErrorReport, NULL, WSA_NOT_ENOUGH_MEMORY
+    mov eax, WSA_NOT_ENOUGH_MEMORY
     ExitMethod
   .endif
   mov xdi, xax
@@ -984,22 +1006,30 @@ Method NetComConnection.QueueConnect, uses xbx xdi xsi, pRemoteAddr:PNETCOMADDR,
   BitSet [xsi].dFlags, NCC_QUEUE_CONNECT
   invoke PTYP_CONNECTEX ptr pConnectEx, [xsi].hSocket, pRemoteAddr, sizeof NETCOMADDR, \
                                        NULL, 0, NULL, xdi
-  .if eax != NO_ERROR                                   ;Did read IO complete synchronously?
-    invoke WSAGetLastError                              ;No, check if it is a pending state
+  ;ConnectEx returns a BOOL: TRUE = completed synchronously (the completion is posted anyway),
+  ;FALSE = pending or failed
+  .if eax == FALSE
+    invoke WSAGetLastError
     .if eax == ERROR_IO_PENDING
       xor eax, eax                                      ;Not an error
     .endif
+  .else
+    xor eax, eax
   .endif
 
   .if eax == 0
     inc [xsi].dPendingIOJobs
+  .else
+    BitClr [xsi].dFlags, NCC_QUEUE_CONNECT
   .endif
   mov ebx, eax
 
   invoke LeaveCriticalSection, addr [xsi].CritSect
 
   .if ebx != 0
-    OCall xsi.OnError, xdi, ebx                         ;pIOJob
+    ;Nothing was queued: return the IOJob. No OnError here, the caller discards the connection.
+    mov xcx, [xsi].pOwner                               ;xcx -> NetComConnectionPool
+    OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, xdi
   .endif
 
   mov eax, ebx

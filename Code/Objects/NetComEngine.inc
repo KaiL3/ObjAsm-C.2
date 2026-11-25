@@ -1,9 +1,15 @@
 ; ==================================================================================================
 ; Title:      NetComEngine.inc
 ; Author:     G. Friedrich
-; Version:    C.1.0
+; Version:    C.1.1
 ; Purpose:    ObjAsm support of NetComEngine objects.
-; Notes:      Version C.1.0, October 2017
+; Notes:      Version C.1.1, November 2026
+;               - NewAcceptor: checks the NetComConnection.Init result; on failure the connection
+;                 is returned to the pool instead of queuing AcceptEx on an invalid socket.
+;               - NewConnection: calls Done before returning a failed connection to the pool.
+;               - DiscardConnection: new. ConnectTo used FreeRessources, whose Close posted
+;                 OnDisconnected/OnClosed completions for a connection already back in the pool.
+;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
 
@@ -174,14 +180,38 @@ Method NetComEngine.ConnectTo, uses xbx xsi, pProtocol:$ObjPtr(NetComProtocol), 
     OCall xbx::NetComConnection.QueueConnect, pRemoteAddr, pLocalAddr
     .if eax != NO_ERROR
       ;If we have an error here, nothing was queued, so we can dispose our connection safely
-      OCall xbx::NetComConnection.FreeRessources          ;Socket is closed here
-      OCall xbx::NetComConnection.Done
-      OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
+      OCall xsi.DiscardConnection, xbx
       xor eax, eax
     .else
       mov xax, xbx                                        ;Return xax -> NetComConnection
     .endif
   .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComEngine.DiscardConnection
+; Purpose:    Releases a connection that has no IO in flight (e.g. QueueConnect failed) and returns
+;             it to the pool.
+; Arguments:  Arg1: -> NetComConnection. Its CritSect must not be held by the caller.
+; Return:     Nothing.
+; Note:       NetComConnection.Close posts OnDisconnected/OnClosed completions to the IOCP. They
+;             would be processed after the connection was returned to the pool (use after free or
+;             delivered to the next connection using the same slot). Therefore the socket is closed
+;             here directly and Close becomes a no-op inside FreeRessources.
+
+Method NetComEngine.DiscardConnection, uses xbx xsi, pConnection:$ObjPtr(NetComConnection)
+  SetObject xsi
+  mov xbx, pConnection
+  .ifBitClr [xbx].$Obj(NetComConnection).dFlags, NCC_CLOSED
+    BitSet [xbx].$Obj(NetComConnection).dFlags, NCC_CLOSED
+    .if [xbx].$Obj(NetComConnection).hSocket != INVALID_SOCKET
+      invoke closesocket, [xbx].$Obj(NetComConnection).hSocket
+      mov [xbx].$Obj(NetComConnection).hSocket, INVALID_SOCKET
+    .endif
+  .endif
+  OCall xbx::NetComConnection.FreeRessources            ;Protocol.Release and IOJob chains
+  OCall xbx::NetComConnection.Done
+  OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -347,6 +377,8 @@ MethodEnd
 ; Return:     eax = Zero if succeeded, otherwise an error code.
 
 Method NetComEngine.NewAcceptor, uses xbx xsi, pListener:PLISTENER, pProtocol:$ObjPtr(NetComProtocol)
+  local dError:DWORD
+
   SetObject xsi
   OCall [xsi].ConnectionPool::NetComConnectionPool.NewItem ;Get a new NetComConnection from the pool
   .if xax == NULL
@@ -354,7 +386,17 @@ Method NetComEngine.NewAcceptor, uses xbx xsi, pListener:PLISTENER, pProtocol:$O
   .else
     mov xbx, xax
     OCall xbx::NetComConnection.Init, addr [xsi].ConnectionPool, pProtocol
-    OCall xbx::NetComConnection.QueueAccept, pListener  ;Queue the accept job
+    .if eax == 0                                        ;Zero means success
+      OCall xbx::NetComConnection.QueueAccept, pListener  ;Queue the accept job
+    .else
+      ;Init failed (NetComProtocol.Allocate or socket creation). Nothing was queued and Init has
+      ;released its resources, so the connection can be returned to the pool right away.
+      mov dError, eax
+      DbgWarning "NetComEngine.NewAcceptor - Connection initialization failed"
+      OCall xbx::NetComConnection.Done                  ;Delete the CritSect
+      OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
+      mov eax, dError
+    .endif
   .endif
 MethodEnd
 
@@ -378,6 +420,7 @@ Method NetComEngine.NewConnection, uses xbx xsi, pProtocol:$ObjPtr(NetComProtoco
       mov xax, xbx
     .else
       ;Failed to initialize new connection
+      OCall xbx::NetComConnection.Done                  ;Delete the CritSect
       OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
       xor eax, eax
     .endif

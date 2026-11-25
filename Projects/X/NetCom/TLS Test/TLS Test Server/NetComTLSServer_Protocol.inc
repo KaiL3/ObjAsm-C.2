@@ -118,26 +118,30 @@ MethodEnd
 
 Method NetComTLSServerProtocol.Allocate, uses xbx xsi, pConnection:$ObjPtr(NetComConnection)
   SetObject xsi
+  mov xbx, pConnection
   MemAlloc sizeof SRVPROTDATA
-  .if xax != NULL
-    mov xbx, pConnection
-    mov [xbx].$Obj(NetComConnection).pData, xax
-    m2z [xax].SRVPROTDATA.pNextIOData
-
-    ; Create a new TLS_SChannelContext for this connection
-    New TLS_SChannelContext
-    .if xax != NULL
-      mov [xbx].$Obj(NetComConnection).pTLSContext, xax
-      OCall xax::TLS_SChannelContext.Init, xbx           ;Mandatory: sets default validator etc.
-      ; TLS configuration is applied later via OnConfigureTLS (called from Admit)
-    .else
-      DbgWarning "NetComTLSServerProtocol.Allocate - Failed to create TLS_SChannelContext"
-    .endif
-
-    xor eax, eax
-  .else
-    OCall ErrorReport, NULL, NCSP_OUT_OF_MEMORY
+  .if xax == NULL
+    OCall xsi.ErrorReport, NULL, NCSP_OUT_OF_MEMORY
+    mov eax, WSA_NOT_ENOUGH_MEMORY
+    ExitMethod
   .endif
+  mov [xbx].$Obj(NetComConnection).pData, xax
+  m2z [xax].SRVPROTDATA.pNextIOData
+
+  ; Create a new TLS_SChannelContext for this connection. Without it the connection would run in
+  ; plaintext, so a failure must fail the connection (fail closed). Release is not called then.
+  New TLS_SChannelContext
+  .if xax == NULL
+    DbgWarning "NetComTLSServerProtocol.Allocate - Failed to create TLS_SChannelContext"
+    MemFree [xbx].$Obj(NetComConnection).pData
+    m2z [xbx].$Obj(NetComConnection).pData
+    mov eax, WSA_NOT_ENOUGH_MEMORY
+    ExitMethod
+  .endif
+  mov [xbx].$Obj(NetComConnection).pTLSContext, xax
+  OCall xax::TLS_SChannelContext.Init, xbx             ;Mandatory: sets default validator etc.
+  ; TLS configuration is applied later via OnConfigureTLS (called from Admit)
+  xor eax, eax
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------

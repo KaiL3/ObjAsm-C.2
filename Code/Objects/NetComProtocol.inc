@@ -1,8 +1,10 @@
 ; ==================================================================================================
 ; Title:      NetComProtocol.inc
 ; Author:     G. Friedrich
-; Version:    C.1.0
+; Version:    C.1.1
 ; Purpose:    ObjAsm support of NetComProtocol objects.
+; Notes:      Version C.1.1, November 2026
+;               - Allocate: failure contract documented (fail closed for TLS).
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -37,6 +39,9 @@ endm
 ;             must be stored in pData member of NetComConnection.
 ; Arguments:  Arg1: -> NetComConnection.
 ; Return:     eax = Zero if succeeded, otherwise an error code.
+; Note:       On failure, Allocate must free everything it has allocated; Release is not called and
+;             the connection is discarded. A protocol that requires TLS must fail here if it cannot
+;             create the TLS context, otherwise the connection runs in plaintext.
 
 Method NetComProtocol.Allocate,, pConnection:$ObjPtr(NetComConnection)
   ANNOTATION use:pConnection

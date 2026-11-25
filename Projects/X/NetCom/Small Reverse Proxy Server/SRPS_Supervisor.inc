@@ -1,8 +1,10 @@
 ; ==================================================================================================
 ; Title:      SRPS_Supervisor.inc
 ; Author:     G. Friedrich
-; Version:    C.1.0
+; Version:    C.1.1
 ; Purpose:    ObjAsm support of SRPS_Supervisor objects.
+;             Version C.1.1, November 2026
+;               - Backpressure uses NetComConnection.PauseReceive/ResumeReceive.
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -114,18 +116,14 @@ Method NetComSrpsSupervisor.WorkerJob, uses xbx xdi xsi
             mov eax, [xbx].$Obj(NetComConnection).dSndQueuedIOJobs
             .ifBitClr [xdi].$Obj(NetComConnection).dFlags, NCC_RCV_PAUSED
               .if eax >= [xbx].$Obj(NetComConnection).dSndHighWtrMrk
-                ;Stop receiving
-                BitSet [xdi].$Obj(NetComConnection).dFlags, NCC_RCV_PAUSED
+                ;Stop receiving (TCP throttles the peer)
+                OCall xdi::NetComConnection.PauseReceive
                 DbgText "NCC_RCV_PAUSED"
               .endif
             .else
               .if eax <= [xbx].$Obj(NetComConnection).dSndLowWtrMrk
-                ;Reenable receive IOJobs
-                BitClr [xdi].$Obj(NetComConnection).dFlags, NCC_RCV_PAUSED
-                .if [xdi].$Obj(NetComConnection).dRcvQueuedIOJobs == 0
-                  ;If nothing is queued, issue a receive IOJob
-                  OCall xdi::NetComConnection.QueueReceive
-                .endif
+                ;Reenable receive IOJobs (posts a receive if none is outstanding)
+                OCall xdi::NetComConnection.ResumeReceive
               .endif
             .endif
             invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect

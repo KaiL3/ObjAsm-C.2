@@ -71,7 +71,9 @@ NetCom does **not** create or free TLS contexts. In the protocol object:
   store it in `[pConn].pTLSContext`. (Allocate runs in `NetComConnection.Init`, i.e. before
   accept/connect.) `New` only copies the template: without `Init` there is no default validator,
   and every client handshake ends in `TLS_CERTIFICATE_INVALID` (111111134) after a successful
-  SSPI handshake - seen in the TLS Test client on 2026-10-12.
+  SSPI handshake - seen in the TLS Test client on 2026-10-12. If `New` fails, **return an error
+  code** (and free what Allocate already allocated): the connection is then discarded. Returning 0
+  without a context runs the connection in plaintext (O16).
 - `OnConfigureTLS(pConn)`: return a shared `TLS_Connection_Config` (or NULL for context defaults).
   The config must **outlive every connection**: the context stores the cipher-suite pointer, it
   does not copy it, and credentials may be re-acquired later.

@@ -143,11 +143,11 @@ Method NetComSrpsProtocol.OnAccepted, uses xbx xdi xsi, pConnection:$ObjPtr(NetC
   invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
   OCall xdi::NetComConnection.QueueConnect, addr [xsi].ServerRemoteAddr, addr [xsi].ServerLocalAddr
   .if eax != NO_ERROR
-    ;If we have an error here, nothing was queued, so we can dispose our connection safely
-    OCall xdi::NetComConnection.FreeRessources          ;Socket is closed here
+    ;If we have an error here, nothing was queued, so we can dispose our connection safely.
+    ;DiscardConnection does not post OnDisconnected/OnClosed (FreeRessources would).
     invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-    OCall xdi::NetComConnection.Done
-    OCall [xdi].$Obj(NetComConnection).pOwner::NetComConnectionPool.FreeItem, xdi
+    mov xax, [xsi].pOwner                               ;xax -> Application
+    OCall [xax].$Obj(Application).RevProxy::NetComEngine.DiscardConnection, xdi
 
     ;Acceptor teardown
     OCall xbx::NetComConnection.Disconnect, SD_SEND

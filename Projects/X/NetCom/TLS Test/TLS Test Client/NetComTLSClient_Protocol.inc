@@ -64,16 +64,18 @@ Method NetComTLSClientProtocol.Allocate, uses xbx xsi, pConnection:$ObjPtr(NetCo
     ExitMethod
   .endif
 
-  ; Create a new TLS_SChannelContext for this client connection
+  ; Create a new TLS_SChannelContext for this client connection. Without it the connection would
+  ; run in plaintext, so a failure must fail the connection (fail closed).
   New TLS_SChannelContext
-  .if xax != NULL
-    mov [xbx].$Obj(NetComConnection).pTLSContext, xax
-    ; Init is mandatory: New only copies the template. Init sets the default
-    ; TLS_DefaultCertValidator; without it ValidatePeer fails (no validator).
-    OCall xax::TLS_SChannelContext.Init, xbx
-  .else
+  .if xax == NULL
     DbgWarning "NetComTLSClientProtocol.Allocate - Failed to create TLS_SChannelContext"
+    mov eax, WSA_NOT_ENOUGH_MEMORY
+    ExitMethod
   .endif
+  mov [xbx].$Obj(NetComConnection).pTLSContext, xax
+  ; Init is mandatory: New only copies the template. Init sets the default
+  ; TLS_DefaultCertValidator; without it ValidatePeer fails (no validator).
+  OCall xax::TLS_SChannelContext.Init, xbx
 
   xor eax, eax
 MethodEnd
