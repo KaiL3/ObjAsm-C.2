@@ -67,6 +67,17 @@ SECPKG_ATTR_STREAM_SIZES        equ   4
 SECPKG_ATTR_REMOTE_CERT_CONTEXT equ   83
 
 ; --------------------------------------------------------------------------------------------------
+;    Credential Attributes (QueryCredentialsAttributes)
+; --------------------------------------------------------------------------------------------------
+
+SecPkgCred_SupportedAlgs struct
+  cSupportedAlgs    DWORD   ?
+  palgSupportedAlgs POINTER ?                           ;-> ALG_ID array, free with FreeContextBuffer
+SecPkgCred_SupportedAlgs ends
+
+SECPKG_ATTR_SUPPORTED_ALGS      equ   86
+
+; --------------------------------------------------------------------------------------------------
 ;    Credential / Context Requirement Flags
 ; --------------------------------------------------------------------------------------------------
 
@@ -132,12 +143,16 @@ SEC_E_ALGORITHM_MISMATCH        equ   80090331h
 
 @DefProto DllImport, AcquireCredentialsHandleW, WIN_STD_CALL_CONV,, \
   <:POINTER, :POINTER, :DWORD, :POINTER, :POINTER, :POINTER, :POINTER, :PCredHandle, :PTimeStamp>, 36
+@DefProto DllImport, AcquireCredentialsHandleA, WIN_STD_CALL_CONV,, \
+  <:POINTER, :POINTER, :DWORD, :POINTER, :POINTER, :POINTER, :POINTER, :PCredHandle, :PTimeStamp>, 36
 AcquireCredentialsHandle equ AcquireCredentialsHandleW
 
 @DefProto DllImport, FreeCredentialsHandle, WIN_STD_CALL_CONV,, \
   <:PCredHandle>, 4
 
 @DefProto DllImport, InitializeSecurityContextW, WIN_STD_CALL_CONV,, \
+  <:PCredHandle, :PCtxtHandle, :POINTER, :DWORD, :DWORD, :DWORD, :PSecBufferDesc, :DWORD, :PCtxtHandle, :PSecBufferDesc, :POINTER, :PTimeStamp>, 48
+@DefProto DllImport, InitializeSecurityContextA, WIN_STD_CALL_CONV,, \
   <:PCredHandle, :PCtxtHandle, :POINTER, :DWORD, :DWORD, :DWORD, :PSecBufferDesc, :DWORD, :PCtxtHandle, :PSecBufferDesc, :POINTER, :PTimeStamp>, 48
 InitializeSecurityContext equ InitializeSecurityContextW
 
@@ -149,7 +164,15 @@ InitializeSecurityContext equ InitializeSecurityContextW
 
 @DefProto DllImport, QueryContextAttributesW, WIN_STD_CALL_CONV,, \
   <:PCtxtHandle, :DWORD, :POINTER>, 12
+@DefProto DllImport, QueryContextAttributesA, WIN_STD_CALL_CONV,, \
+  <:PCtxtHandle, :DWORD, :POINTER>, 12
 QueryContextAttributes equ QueryContextAttributesW
+
+@DefProto DllImport, QueryCredentialsAttributesW, WIN_STD_CALL_CONV,, \
+  <:PCredHandle, :DWORD, :POINTER>, 12
+@DefProto DllImport, QueryCredentialsAttributesA, WIN_STD_CALL_CONV,, \
+  <:PCredHandle, :DWORD, :POINTER>, 12
+QueryCredentialsAttributes equ QueryCredentialsAttributesW
 
 @DefProto DllImport, EncryptMessage, WIN_STD_CALL_CONV,, \
   <:PCtxtHandle, :DWORD, :PSecBufferDesc, :DWORD>, 16

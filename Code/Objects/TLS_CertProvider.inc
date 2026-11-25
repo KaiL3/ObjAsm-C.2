@@ -47,6 +47,12 @@ endif
 ifndef CERT_NCRYPT_KEY_SPEC
   CERT_NCRYPT_KEY_SPEC              equ 0FFFFFFFFh
 endif
+ifndef CERT_STORE_OPEN_EXISTING_FLAG
+  CERT_STORE_OPEN_EXISTING_FLAG     equ 00004000h
+endif
+ifndef CERT_STORE_READONLY_FLAG
+  CERT_STORE_READONLY_FLAG          equ 00008000h
+endif
 
 
 ; --------------------------------------------------------------------------------------------------
@@ -168,15 +174,20 @@ MethodEnd
 
 Method TLS_CertProvider.FindCert, uses xbx xdi xsi
   local hStore:HANDLE, dFindType:DWORD, hKey:XWORD, dKeySpec:DWORD, bCallerFree:DWORD
+  local dOpenFlags:DWORD
   local pCertSerial:POINTER, pSearchSerial:POINTER, dSerialSize:DWORD
 
   SetObject xsi
   xor eax, eax
   mov xbx, xax                                       ;xbx = NULL (default return value)
 
-  ; Open the system certificate store
-  invoke CertOpenStore, CERT_STORE_PROV_SYSTEM, 0, 0, \
-                        [xsi].dStoreScope, [xsi].pStoreName
+  ; Open the system certificate store read-only. Without CERT_STORE_READONLY_FLAG the store is
+  ; opened for writing, which fails with ACCESS_DENIED for non-admin accounts (e.g. a service
+  ; reading LocalMachine\MY). OPEN_EXISTING avoids creating a misspelled store.
+  mov eax, [xsi].dStoreScope
+  or eax, CERT_STORE_READONLY_FLAG or CERT_STORE_OPEN_EXISTING_FLAG
+  mov dOpenFlags, eax
+  invoke CertOpenStore, CERT_STORE_PROV_SYSTEM, 0, 0, dOpenFlags, [xsi].pStoreName
   .if xax == NULL
     DbgWarning "TLS_CertProvider.FindCert - Cannot open store"
     xor eax, eax

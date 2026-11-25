@@ -132,6 +132,7 @@ IAT_Hook
 WebTextTranslator
 
 TLS_CertValidator
+TLS_CertProvider
 TLS_ClientCertProvider
 TLS_ServerCertProvider
 TLS_Context

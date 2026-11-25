@@ -94,6 +94,6 @@ CERT_E_CHAINING                  equ   800B010Ah
 CERT_E_REVOKED                   equ   800B010Ch
 CERT_E_REVOCATION_FAILURE        equ   800B010Eh
 
-SslGetServerIdentity proto WIN_STD_CALL_CONV :ptr BYTE, DWORD, :ptr BYTE, :ptr DWORD, DWORD
+SslGetServerIdentity proto WIN_STD_CALL_CONV :POINTER, :DWORD, :POINTER, :POINTER, :DWORD  ;pClientHello, cbClientHello, ppServerName, pcbServerName, dwFlags
 
 endif ;__SCHANNEL_INC__

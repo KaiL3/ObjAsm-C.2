@@ -1,13 +1,16 @@
 ; ==================================================================================================
 ; Title:      TLS_Context.inc
 ; Author:     Kai Liebenau
-; Version:    C.2.0
+; Version:    C.2.1
 ; Purpose:    ObjAsm TLS/SSL encryption support for the NetCom framework.
 ;             Defines TLS state constants, search type constants, error codes, and the abstract
 ;             TLS_Context base class used by NetComConnection for polymorphic TLS operations.
 ; Links:      - https://learn.microsoft.com/en-us/windows/win32/secauthn/schannel
 ;             - https://learn.microsoft.com/en-us/windows/win32/secauthn/creating-an-schannel-security-context
 ; Notes:      This file requires the NetCom framework objects to be loaded.
+;             Version C.2.1
+;               - bHandshakeDone moved here from TLS_SChannelContext (NetComSupervisor handshake
+;                 timeout), new error code TLS_HANDSHAKE_TIMEOUT.
 ;             Version C.1.0
 ;               - Initial release.
 ; ==================================================================================================
@@ -50,6 +53,7 @@ AddErrMsg TLS_SERVER_CERT_NOT_PROVIDED,   "Server-Zertifikats-Provider lieferte 
 AddErrMsg TLS_SERVER_CERT_NO_PRIVATE_KEY, "Server-Zertifikat ohne privaten Schluessel"
 AddErrMsg TLS_BUFFER_ALLOC_FAILED,        "TLS-Puffer-Allokation fehlgeschlagen"
 AddErrMsg TLS_CONFIG_DURING_HANDSHAKE,    "TLS-Konfigurationsaenderung waehrend aktivem Handshake nicht erlaubt"
+AddErrMsg TLS_HANDSHAKE_TIMEOUT,          "TLS handshake timeout"
 
 
 ; ==================================================================================================
@@ -114,6 +118,7 @@ Object TLS_Context, TLS_ContextID, Primer
   VirtualMethod     SetAllowedCipherSuites, POINTER, DWORD  ; pAlgIDArray, dCount
   VirtualMethod     SetTargetName,          POINTER       ; pszTargetName (ANSI, for SNI + cert validation)
   VirtualMethod     SetVerifyServerName,    DWORD         ; TRUE/FALSE
+  VirtualMethod     SetMutualAuth,          DWORD         ; TRUE/FALSE (server: request + require client cert)
   VirtualMethod     GetNegotiatedProtocol                 ; Return in eax
   VirtualMethod     GetNegotiatedCipherSuite              ; Return in eax
 
@@ -127,6 +132,8 @@ Object TLS_Context, TLS_ContextID, Primer
   DefineVariable    dMaxMessageSize,      DWORD,    0     ;Max plaintext bytes per TLS record (set after handshake)
   DefineVariable    pTargetName,          POINTER,  NULL  ;Server hostname for SNI (ANSI, owned via StrNewA)
   DefineVariable    bVerifyServerName,    DWORD,    TRUE  ;Validate cert CN/SAN against pTargetName
+  DefineVariable    bMutualAuth,          DWORD,    FALSE ;Server: request and require a client certificate
+  DefineVariable    bHandshakeDone,       DWORD,    FALSE ;TRUE after the first completed handshake
 
   ; Reassembly buffer (managed by derived class, accessed by NetComConnection)
   DefineVariable    pReassemblyBuffer,    POINTER,  NULL
@@ -274,6 +281,24 @@ MethodEnd
 Method TLS_Context.SetVerifyServerName, uses xsi, bVerify:DWORD
   SetObject xsi
   m2m [xsi].bVerifyServerName, bVerify, eax
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_Context.SetMutualAuth
+; Purpose:    Server side: request a client certificate during the handshake and require it.
+;             The client certificate is validated with TLS_CertValidator.ValidateClient.
+; Arguments:  Arg1: TRUE to require a client certificate, FALSE otherwise.
+; Return:     eax = OBJ_OK on success, TLS_CONFIG_DURING_HANDSHAKE if handshake active.
+
+Method TLS_Context.SetMutualAuth, uses xsi, bMutual:DWORD
+  SetObject xsi
+  OCall xsi.GetState
+  .if eax == TLS_STATE_HANDSHAKE
+    mov eax, TLS_CONFIG_DURING_HANDSHAKE
+  .else
+    m2m [xsi].bMutualAuth, bMutual, eax
+    mov eax, OBJ_OK
+  .endif
 MethodEnd
 
 endif

@@ -8,7 +8,10 @@
 ;             Optionally verifies hostname (CN/SAN) via SSL_EXTRA_CERT_CHAIN_POLICY_PARA.
 ; Links:      - https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatechain
 ;             - https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certverifycertificatechainpolicy
-; Notes:      Version C.2.0
+; Notes:      Version C.2.1
+;               - Fail closed on all errors, EKU check, peer store as additional store,
+;                 client certificate validation (ValidateClient, AUTHTYPE_CLIENT).
+;             Version C.2.0
 ;               - Added hostname verification via pszServerName parameter.
 ;             Version C.1.0
 ;               - Initial release.
@@ -29,11 +32,23 @@
 
 Object TLS_DefaultCertValidator, TLS_DefaultCertValidatorID, TLS_CertValidator
   RedefineMethod  Validate,           POINTER, POINTER  ; pCertContext, pszServerName (ANSI or NULL)
+  RedefineMethod  ValidateClient,     POINTER           ; pCertContext (client certificate)
+  StaticMethod    DoValidate,         POINTER, POINTER, DWORD ; pCertContext, pszServerName, dAuthType
 ObjectEnd
 
 ; ==================================================================================================
 
 if IMPLEMENT
+
+ifndef E_OUTOFMEMORY
+  E_OUTOFMEMORY             equ   8007000Eh
+endif
+
+.const
+  ; Extended Key Usage OIDs (ANSI, as required by CERT_ENHKEY_USAGE)
+  szTLS_OID_ServerAuth  db "1.3.6.1.5.5.7.3.1", 0     ;szOID_PKIX_KP_SERVER_AUTH
+  szTLS_OID_ClientAuth  db "1.3.6.1.5.5.7.3.2", 0     ;szOID_PKIX_KP_CLIENT_AUTH
+.code
 
 ; ==================================================================================================
 ;    TLS_DefaultCertValidator implementation
@@ -41,137 +56,138 @@ if IMPLEMENT
 
 ; --------------------------------------------------------------------------------------------------
 ; Method:     TLS_DefaultCertValidator.Validate
-; Purpose:    Validates a peer certificate by building and verifying the certificate chain.
-;             Uses CertGetCertificateChain to build the chain, then
-;             CertVerifyCertificateChainPolicy with CERT_CHAIN_POLICY_SSL to verify it.
-;             If pszServerName is provided (non-NULL), additionally verifies the certificate
-;             CN/SAN against the hostname using SSL_EXTRA_CERT_CHAIN_POLICY_PARA.
+; Purpose:    Validates a SERVER certificate (client side). See DoValidate.
 ; Arguments:  Arg1: -> CERT_CONTEXT (peer certificate to validate).
 ;             Arg2: -> ANSI server hostname for CN/SAN check (or NULL to skip hostname check).
 ; Return:     eax = HRESULT (S_OK on success, CERT_E_xxx on failure).
 
-Method TLS_DefaultCertValidator.Validate, uses xbx xdi xsi, pCertContext:POINTER, pszServerName:POINTER
+Method TLS_DefaultCertValidator.Validate, uses xsi, pCertContext:POINTER, pszServerName:POINTER
+  SetObject xsi
+  OCall xsi.DoValidate, pCertContext, pszServerName, AUTHTYPE_SERVER
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_DefaultCertValidator.ValidateClient
+; Purpose:    Validates a CLIENT certificate (server side, mutual authentication). See DoValidate.
+; Arguments:  Arg1: -> CERT_CONTEXT (client certificate to validate).
+; Return:     eax = HRESULT (S_OK on success, CERT_E_xxx on failure).
+
+Method TLS_DefaultCertValidator.ValidateClient, uses xsi, pCertContext:POINTER
+  SetObject xsi
+  OCall xsi.DoValidate, pCertContext, NULL, AUTHTYPE_CLIENT
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_DefaultCertValidator.DoValidate
+; Purpose:    Validates a peer certificate by building and verifying the certificate chain.
+;             - CertGetCertificateChain with the peer's own certificate store as additional
+;               store (intermediate CAs sent in the handshake) and the required Extended Key
+;               Usage (Server Authentication or Client Authentication).
+;             - CertVerifyCertificateChainPolicy with CERT_CHAIN_POLICY_SSL and
+;               SSL_EXTRA_CERT_CHAIN_POLICY_PARA (dAuthType, optional hostname check).
+;             Fails closed: every error (including out of memory) is reported as failure.
+; Arguments:  Arg1: -> CERT_CONTEXT (peer certificate to validate).
+;             Arg2: -> ANSI hostname for the CN/SAN check (or NULL to skip it).
+;             Arg3: AUTHTYPE_SERVER (validate a server cert) or AUTHTYPE_CLIENT (client cert).
+; Return:     eax = HRESULT (S_OK on success, CERT_E_xxx / error code on failure).
+; Note:       No revocation check is performed (dwFlags = 0).
+
+Method TLS_DefaultCertValidator.DoValidate, uses xbx xdi xsi, pCertContext:POINTER, \
+                                           pszServerName:POINTER, dAuthType:DWORD
   local ChainPara:CERT_CHAIN_PARA
   local PolicyPara:CERT_CHAIN_POLICY_PARA
   local PolicyStatus:CERT_CHAIN_POLICY_STATUS
   local pChainContext:PCCERT_CHAIN_CONTEXT
   local SslPolicyPara:SSL_EXTRA_CERT_CHAIN_POLICY_PARA
   local pWideServerName:POINTER
+  local pUsageOID:POINTER
+  local hPeerStore:HANDLE
 
   SetObject xsi
   mov pWideServerName, NULL
+  mov pChainContext, NULL
+  mov ebx, CERT_E_UNTRUSTEDROOT                         ;Default result: failure
 
   ; --- Validate input ---
   .if pCertContext == NULL
-    mov eax, CERT_E_UNTRUSTEDROOT
-    jmp @@Exit
+    jmp @@Cleanup
   .endif
 
-  ; --- Initialize CERT_CHAIN_PARA ---
-  lea xdi, ChainPara
-  xor eax, eax
-  mov ecx, sizeof(CERT_CHAIN_PARA)
-  push xdi
-  ;Zero-fill the structure
-  if TARGET_BITNESS eq 32
-    shr ecx, 2
-    rep stosd
-  else
-    shr ecx, 3
-    rep stosq
-  endif
-  pop xdi
+  ; --- CERT_CHAIN_PARA with the required Extended Key Usage ---
+  invoke MemZero, addr ChainPara, sizeof(CERT_CHAIN_PARA)
   mov ChainPara.cbSize, sizeof(CERT_CHAIN_PARA)
+  .if dAuthType == AUTHTYPE_CLIENT
+    lea xax, szTLS_OID_ClientAuth
+  .else
+    lea xax, szTLS_OID_ServerAuth
+  .endif
+  mov pUsageOID, xax
+  mov ChainPara.RequestedUsage.dwType, USAGE_MATCH_TYPE_AND
+  mov ChainPara.RequestedUsage.Usage.cUsageIdentifier, 1
+  lea xax, pUsageOID
+  mov ChainPara.RequestedUsage.Usage.rgpszUsageIdentifier, xax
 
   ; --- Build the certificate chain ---
-  mov pChainContext, NULL
+  ; The peer's store contains the intermediate certificates sent during the handshake.
+  mov xax, pCertContext
+  m2m hPeerStore, [xax].CERT_CONTEXT.hCertStore, xcx
   invoke CertGetCertificateChain, \
          NULL, \                                ; hChainEngine (NULL = default engine)
          pCertContext, \                        ; pCertContext
          NULL, \                                ; pTime (NULL = current time)
-         NULL, \                                ; hAdditionalStore (none)
+         hPeerStore, \                          ; hAdditionalStore (peer supplied certificates)
          addr ChainPara, \                      ; pChainPara
-         0, \                                   ; dwFlags (no revocation check for performance)
+         0, \                                   ; dwFlags (no revocation check)
          NULL, \                                ; pvReserved
          addr pChainContext                     ; ppChainContext (output)
-
   .if eax == FALSE
-    ; CertGetCertificateChain failed - cannot build chain
-    mov eax, CERT_E_UNTRUSTEDROOT
-    jmp @@Exit
+    jmp @@Cleanup                               ;Cannot build chain => untrusted
   .endif
 
-  ; --- Initialize CERT_CHAIN_POLICY_PARA ---
-  mov PolicyPara.cbSize, sizeof(CERT_CHAIN_POLICY_PARA)
-  mov PolicyPara.dwFlags, 0
-  mov PolicyPara.pvExtraPolicyPara, NULL
-
-  ; --- Setup SSL_EXTRA_CERT_CHAIN_POLICY_PARA for hostname verification ---
+  ; --- SSL_EXTRA_CERT_CHAIN_POLICY_PARA: auth type and optional hostname ---
+  invoke MemZero, addr SslPolicyPara, sizeof(SSL_EXTRA_CERT_CHAIN_POLICY_PARA)
+  mov SslPolicyPara.cbSize, sizeof(SSL_EXTRA_CERT_CHAIN_POLICY_PARA)
+  m2m SslPolicyPara.dwAuthType, dAuthType, eax
+  mov SslPolicyPara.fdwChecks, 0
   .if pszServerName != NULL
-    ; Convert ANSI hostname to WIDE (required by SSL_EXTRA_CERT_CHAIN_POLICY_PARA.pwszServerName)
+    ; Convert ANSI hostname to WIDE (required by pwszServerName)
     invoke StrA2NewStrW, pszServerName
-    mov pWideServerName, xax
-    .if xax != NULL
-      mov SslPolicyPara.cbSize, sizeof(SSL_EXTRA_CERT_CHAIN_POLICY_PARA)
-      mov SslPolicyPara.dwAuthType, AUTHTYPE_SERVER
-      mov SslPolicyPara.fdwChecks, 0
-      m2m SslPolicyPara.pwszServerName, pWideServerName, xax
-      lea xax, SslPolicyPara
-      mov PolicyPara.pvExtraPolicyPara, xax
+    .if xax == NULL
+      mov ebx, E_OUTOFMEMORY                    ;Fail closed - never skip the hostname check
+      jmp @@Cleanup
     .endif
+    mov pWideServerName, xax
+    mov SslPolicyPara.pwszServerName, xax
   .endif
 
-  ; --- Initialize CERT_CHAIN_POLICY_STATUS ---
+  invoke MemZero, addr PolicyPara, sizeof(CERT_CHAIN_POLICY_PARA)
+  mov PolicyPara.cbSize, sizeof(CERT_CHAIN_POLICY_PARA)
+  lea xax, SslPolicyPara
+  mov PolicyPara.pvExtraPolicyPara, xax
+
+  invoke MemZero, addr PolicyStatus, sizeof(CERT_CHAIN_POLICY_STATUS)
   mov PolicyStatus.cbSize, sizeof(CERT_CHAIN_POLICY_STATUS)
-  mov PolicyStatus.dwError, 0
-  mov PolicyStatus.lChainIndex, 0
-  mov PolicyStatus.lElementIndex, 0
-  mov PolicyStatus.pvExtraPolicyStatus, NULL
 
   ; --- Verify certificate chain policy (CERT_CHAIN_POLICY_SSL) ---
   invoke CertVerifyCertificateChainPolicy, \
-         CERT_CHAIN_POLICY_SSL, \              ; pszPolicyOID (MAKEINTRESOURCE-style)
-         pChainContext, \                       ; pChainContext
-         addr PolicyPara, \                     ; pPolicyPara
-         addr PolicyStatus                      ; pPolicyStatus
-
-  .if eax == FALSE
-    ; CertVerifyCertificateChainPolicy API call itself failed
-    invoke CertFreeCertificateChain, pChainContext
-    .if pWideServerName != NULL
-      invoke StrDispose, pWideServerName
-    .endif
-    mov eax, CERT_E_UNTRUSTEDROOT
-    jmp @@Exit
+         CERT_CHAIN_POLICY_SSL, \
+         pChainContext, \
+         addr PolicyPara, \
+         addr PolicyStatus
+  .if eax != FALSE
+    ; dwError already contains a meaningful HRESULT (0 = S_OK, CERT_E_EXPIRED,
+    ; CERT_E_UNTRUSTEDROOT, CERT_E_CN_NO_MATCH, CERT_E_WRONG_USAGE, ...)
+    mov ebx, PolicyStatus.dwError
   .endif
 
-  ; --- Evaluate policy status ---
-  mov eax, PolicyStatus.dwError
-  .if eax == 0
-    ; Validation successful
+@@Cleanup:
+  .if pChainContext != NULL
     invoke CertFreeCertificateChain, pChainContext
-    .if pWideServerName != NULL
-      invoke StrDispose, pWideServerName
-    .endif
-    xor eax, eax                                ; S_OK = 0
-    jmp @@Exit
   .endif
-
-  ; --- Map policy errors to structured HRESULT codes ---
-  ; The dwError already contains a meaningful HRESULT from the chain policy engine.
-  ; We pass it through directly, as it maps to CERT_E_EXPIRED, CERT_E_UNTRUSTEDROOT,
-  ; CERT_E_CN_NO_MATCH, etc. depending on the specific failure.
-  mov ebx, eax                                  ; Save error code
-
-  ; Free resources before returning
-  invoke CertFreeCertificateChain, pChainContext
   .if pWideServerName != NULL
     invoke StrDispose, pWideServerName
   .endif
-
-  mov eax, ebx                                  ; Return the policy status error as HRESULT
-
-@@Exit:
+  mov eax, ebx
 MethodEnd
 
 endif

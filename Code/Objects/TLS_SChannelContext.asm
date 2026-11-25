@@ -19,6 +19,7 @@ INTERNET_PROTOCOL_VERSION   equ 4
 % include &IncPath&Windows\WinSock2.inc
 % include &IncPath&Windows\ws2ipdef.inc
 % include &IncPath&Windows\ws2tcpip.inc
+% include &IncPath&Windows\wincrypt.inc         ;Not included by Windows.inc with WIN32_LEAN_AND_MEAN
 
 if INTERNET_PROTOCOL_VERSION eq 4
   AF_INETX  equ   AF_INET
@@ -40,6 +41,8 @@ LoadObjects DataPool
 LoadObjects StopWatch
 LoadObjects TLS_Context
 LoadObjects TLS_CertValidator
+LoadObjects TLS_DefaultCertValidator              ;Default validator template (Init)
+LoadObjects TLS_CertProvider
 LoadObjects TLS_ClientCertProvider
 LoadObjects TLS_ServerCertProvider
 LoadObjects NetCom

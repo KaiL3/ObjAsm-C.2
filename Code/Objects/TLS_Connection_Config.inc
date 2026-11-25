@@ -271,14 +271,14 @@ MethodEnd
 ; Purpose:    Returns the certificate validator reference.
 ; Arguments:  None.
 ; Return:     xax -> TLS_CertValidator or NULL.
+; Note:       NULL means "no explicit validator": ApplyTLSConfig then leaves the validator of the
+;             TLS_Context untouched, i.e. the default validator set by TLS_SChannelContext.Init
+;             (TLS_DefaultCertValidator) stays active. The default is intentionally NOT referenced
+;             here, so NetCom does not depend on the TLS_DefaultCertValidator object.
 
 Method TLS_Connection_Config.GetCertValidator
   SetObject xcx
-  .if [xcx].bValidatorIsSet
-    mov xax, [xcx].pCertValidator
-  .else
-    lea xax, offset $ObjTmpl(TLS_DefaultCertValidator)
-  .endif
+  mov xax, [xcx].pCertValidator
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------

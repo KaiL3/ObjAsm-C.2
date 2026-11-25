@@ -21,6 +21,7 @@
 
 Object TLS_CertValidator, TLS_CertValidatorID, Primer
   VirtualAbstract   Validate,         POINTER, POINTER ; pCertContext, pszServerName (ANSI or NULL) -> HRESULT in eax
+  VirtualMethod     ValidateClient,   POINTER          ; pCertContext (client cert, server side) -> HRESULT in eax
 ObjectEnd
 
 
@@ -30,7 +31,20 @@ if IMPLEMENT
 
 ; ==================================================================================================
 ;    TLS_CertValidator implementation
-;    (No concrete methods – Validate is abstract)
 ; ==================================================================================================
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_CertValidator.ValidateClient
+; Purpose:    Validates a CLIENT certificate (server side, mutual authentication).
+;             Default implementation: delegates to Validate without hostname, so existing
+;             validators keep working. Override it to apply client specific rules
+;             (e.g. AUTHTYPE_CLIENT / Client Authentication EKU).
+; Arguments:  Arg1: -> CERT_CONTEXT of the client certificate.
+; Return:     eax = HRESULT (S_OK on success).
+
+Method TLS_CertValidator.ValidateClient, uses xsi, pCertContext:POINTER
+  SetObject xsi
+  OCall xsi.Validate, pCertContext, NULL
+MethodEnd
 
 endif

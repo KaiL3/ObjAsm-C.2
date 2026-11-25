@@ -1,13 +1,16 @@
 ; ==================================================================================================
 ; Title:      TLS_SChannelContext.inc
 ; Author:     Kai Liebenau
-; Version:    C.2.0
+; Version:    C.2.1
 ; Purpose:    ObjAsm SChannel/SSPI-based implementation of TLS_Context.
 ;             Manages SSPI credentials, security contexts, internal reassembly and encryption
 ;             buffers for TLS record processing.
 ; Links:      - https://learn.microsoft.com/en-us/windows/win32/secauthn/schannel
 ;             - https://learn.microsoft.com/en-us/windows/win32/api/sspi/
 ; Notes:      Requires TLS_Context.inc to be loaded before this file.
+;             Version C.2.1
+;               - bHandshakeDone moved to TLS_Context (used by the NetComSupervisor handshake
+;                 timeout).
 ;             Version C.1.0
 ;               - Initial release.
 ; ==================================================================================================
@@ -161,7 +164,7 @@ ifndef ASC_REQ_STREAM
   ASC_REQ_STREAM              equ   00010000h
 endif
 ifndef ASC_REQ_MUTUAL_AUTH
-  ASC_REQ_MUTUAL_AUTH         equ   00020000h
+  ASC_REQ_MUTUAL_AUTH         equ   00000002h       ;sspi.h (00020000h would be ASC_REQ_INTEGRITY!)
 endif
 
 ; QueryContextAttributes attribute IDs
@@ -179,7 +182,7 @@ endif
 
 ; SslGetServerIdentity prototype (SNI extraction from ClientHello)
 ifndef __SCHANNEL_INC__
-  SslGetServerIdentity proto WIN_STD_CALL_CONV :ptr BYTE, :DWORD, :ptr ptr BYTE, :ptr DWORD, :DWORD
+  SslGetServerIdentity proto WIN_STD_CALL_CONV :POINTER, :DWORD, :POINTER, :POINTER, :DWORD
 endif
 
 ; Security status codes for DecryptMessage / Handshake
@@ -218,6 +221,15 @@ endif
 ifndef SEC_E_INSUFFICIENT_MEMORY
   SEC_E_INSUFFICIENT_MEMORY   equ   80090300h
 endif
+ifndef SEC_E_CERT_UNKNOWN
+  SEC_E_CERT_UNKNOWN          equ   80090327h
+endif
+ifndef CERT_E_UNTRUSTEDROOT
+  CERT_E_UNTRUSTEDROOT        equ   800B0109h
+endif
+ifndef CERT_E_CN_NO_MATCH
+  CERT_E_CN_NO_MATCH          equ   800B010Fh
+endif
 
 ifndef SecBuffer
   SecBuffer struct
@@ -247,6 +259,7 @@ TLS_SERVER_ASC_FLAGS equ ASC_REQ_SEQUENCE_DETECT or ASC_REQ_REPLAY_DETECT or \
                          ASC_REQ_STREAM or ASC_REQ_ALLOCATE_MEMORY
 
 
+ifndef __SSPI_INC__
 ifndef SSPI_PROTOS_DEFINED
   SSPI_PROTOS_DEFINED equ 1
   DeleteSecurityContext proto WIN_STD_CALL_CONV :POINTER
@@ -273,13 +286,17 @@ ifndef SSPI_PROTOS_DEFINED
     QueryContextAttributes textequ <QueryContextAttributesA>
   endif
 endif
+endif
+; Note: pTargetName is always ANSI, therefore the ANSI variants of AcquireCredentialsHandle,
+;       InitializeSecurityContext and QueryContextAttributes are called explicitly.
 
 
 ; ==================================================================================================
 ;    Handshake Buffer Constants
 ; ==================================================================================================
 
-TLS_HANDSHAKE_BUFFER_SIZE   equ   16384     ;Max TLS record size (sufficient for handshake messages)
+TLS_MAX_RECORD_SIZE         equ   18437     ;5 Header + 16384 max. fragment + 2048 max. expansion (RFC 5246)
+TLS_HANDSHAKE_BUFFER_SIZE   equ   TLS_MAX_RECORD_SIZE
 
 
 ; ==================================================================================================
@@ -316,6 +333,10 @@ Object TLS_SChannelContext, TLS_SChannelContextID, TLS_Context
   VirtualMethod   AllocateBuffers
   VirtualMethod   FreeBuffers
   VirtualMethod   TranslateError,     DWORD           ; dSecurityStatus -> xax = -> error string
+  StaticMethod    SendToken,          POINTER         ; -> SecBuffer (send + free SSPI token)
+  StaticMethod    FreeToken,          POINTER         ; -> SecBuffer (free SSPI token)
+  StaticMethod    KeepExtra,          POINTER, POINTER, DWORD ; -> SecBuffer, pData, dDataSize
+  StaticMethod    ValidatePeer                        ; -> eax = OBJ_OK / TLS_CERTIFICATE_INVALID
 
   ; SSPI-Handles
   DefineVariable  hCredential,        CredHandle,     {}
@@ -340,6 +361,8 @@ Object TLS_SChannelContext, TLS_SChannelContextID, TLS_Context
 
   ; Client/Server mode flag (set during StartClientHandshake / StartServerHandshake)
   DefineVariable  bIsClient,          DWORD,          FALSE
+
+  ; bHandshakeDone is defined in TLS_Context (TRUE after the first completed handshake)
 
   ; Stored connection pointer (for handshake callbacks)
   DefineVariable  pConnection,        POINTER,        NULL
@@ -402,6 +425,7 @@ Method TLS_SChannelContext.Init, uses xsi, pOwner:POINTER
 
   ; Reset client/server mode and connection pointer
   mov [xsi].bIsClient, FALSE
+  mov [xsi].bHandshakeDone, FALSE
   mov [xsi].pConnection, NULL
 
   ; Set default certificate validator (can be overridden via SetCertValidator)
@@ -448,60 +472,67 @@ MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
 ; Method:     TLS_SChannelContext.AllocateBuffers
-; Purpose:    Allocates the internal reassembly buffer and encryption buffer based on the
-;             current StreamSizes values (cbHeader + cbMaximumMessage + cbTrailer).
-;             Both buffers are zero-initialized.
+; Purpose:    Ensures that the internal reassembly buffer and encryption buffer are large enough
+;             for the current StreamSizes values (cbHeader + cbMaximumMessage + cbTrailer, at
+;             least TLS_MAX_RECORD_SIZE).
+;             - The reassembly buffer is grown PRESERVING its content (it may already hold
+;               data that followed the last handshake message).
+;             - Existing buffers that are large enough are reused (no leak on re-handshake).
 ; Arguments:  None.
 ; Return:     eax = OBJ_OK on success, TLS_BUFFER_ALLOC_FAILED on failure.
 ; Notes:      StreamSizes must be filled (e.g. via QueryContextAttributes after handshake)
 ;             before calling this method.
 
 Method TLS_SChannelContext.AllocateBuffers, uses xbx xsi
-  local dRequiredSize:DWORD
+  local dRequiredSize:DWORD, pNewBuffer:POINTER
 
   SetObject xsi
 
-  ; Calculate required size: cbHeader + cbMaximumMessage + cbTrailer
+  ; Calculate required size: cbHeader + cbMaximumMessage + cbTrailer (min. TLS_MAX_RECORD_SIZE)
   mov eax, [xsi].StreamSizes.cbHeader
   add eax, [xsi].StreamSizes.cbMaximumMessage
   add eax, [xsi].StreamSizes.cbTrailer
+  .if eax < TLS_MAX_RECORD_SIZE
+    mov eax, TLS_MAX_RECORD_SIZE
+  .endif
   mov dRequiredSize, eax
 
-  ; Reallocate Reassembly buffer if needed (may already exist from handshake)
-  .if [xsi].pReassemblyBuffer != NULL
-    ; Check if existing buffer is large enough
-    mov eax, dRequiredSize
-    .if eax > [xsi].dReassemblyCapacity
-      ; Need larger buffer - free old one and allocate new
-      MemFree [xsi].pReassemblyBuffer
-      mov [xsi].pReassemblyBuffer, NULL
-    .endif
-  .endif
-  .if [xsi].pReassemblyBuffer == NULL
+  ; --- Reassembly buffer: grow if needed, keeping dReassemblyUsed BYTEs ---
+  .if [xsi].pReassemblyBuffer == NULL || eax > [xsi].dReassemblyCapacity
     MemAlloc dRequiredSize, MEM_INIT_ZERO
     .if xax == NULL
       mov [xsi].dState, TLS_STATE_ERROR
       mov eax, TLS_BUFFER_ALLOC_FAILED
       jmp @@Exit
     .endif
-    mov [xsi].pReassemblyBuffer, xax
+    mov pNewBuffer, xax
+    .if [xsi].pReassemblyBuffer != NULL
+      .if [xsi].dReassemblyUsed != 0
+        invoke MemClone, pNewBuffer, [xsi].pReassemblyBuffer, [xsi].dReassemblyUsed
+      .endif
+      MemFree [xsi].pReassemblyBuffer
+    .endif
+    m2m [xsi].pReassemblyBuffer, pNewBuffer, xax
     m2m [xsi].dReassemblyCapacity, dRequiredSize, eax
   .endif
-  mov [xsi].dReassemblyUsed, 0
 
-  ; Allocate Encryption buffer (zero-initialized)
-  MemAlloc dRequiredSize, MEM_INIT_ZERO
-  .if xax == NULL
-    ; Allocation failed - free already allocated reassembly buffer
-    MemFree [xsi].pReassemblyBuffer
-    mov [xsi].pReassemblyBuffer, NULL
-    mov [xsi].dReassemblyCapacity, 0
-    mov [xsi].dState, TLS_STATE_ERROR
-    mov eax, TLS_BUFFER_ALLOC_FAILED
-    jmp @@Exit
+  ; --- Encryption buffer: (re)allocate only if missing or too small ---
+  mov eax, dRequiredSize
+  .if [xsi].pEncryptBuffer == NULL || eax > [xsi].dEncryptBufferSize
+    .if [xsi].pEncryptBuffer != NULL
+      MemFree [xsi].pEncryptBuffer
+      mov [xsi].pEncryptBuffer, NULL
+      mov [xsi].dEncryptBufferSize, 0
+    .endif
+    MemAlloc dRequiredSize, MEM_INIT_ZERO
+    .if xax == NULL
+      mov [xsi].dState, TLS_STATE_ERROR
+      mov eax, TLS_BUFFER_ALLOC_FAILED
+      jmp @@Exit
+    .endif
+    mov [xsi].pEncryptBuffer, xax
+    m2m [xsi].dEncryptBufferSize, dRequiredSize, eax
   .endif
-  mov [xsi].pEncryptBuffer, xax
-  m2m [xsi].dEncryptBufferSize, dRequiredSize, eax
 
   ; Success
   mov eax, OBJ_OK
@@ -567,6 +598,12 @@ Method TLS_SChannelContext.Encrypt, uses xbx xdi xsi, pPlaintext:POINTER, dSize:
   local BufferDesc:SecBufferDesc
 
   SetObject xsi
+
+  ; Only an established session can encrypt
+  .if [xsi].pEncryptBuffer == NULL || [xsi].dState != TLS_STATE_DATA
+    mov eax, TLS_ENCRYPT_ERROR
+    jmp @@Exit
+  .endif
 
   ; Validate: dSize must not exceed cbMaximumMessage
   mov eax, dSize
@@ -826,12 +863,153 @@ Method TLS_SChannelContext.Decrypt, uses xbx xdi xsi, pCiphertext:POINTER, dSize
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
+; Method:     TLS_SChannelContext.SendToken
+; Purpose:    Sends an SSPI output token (handshake message, alert or shutdown token) unencrypted
+;             to the peer and releases the SSPI allocated memory.
+; Arguments:  Arg1: -> SecBuffer (pvBuffer allocated by SSPI or NULL).
+; Return:     Nothing. The SecBuffer is reset (pvBuffer = NULL, cbBuffer = 0).
+
+Method TLS_SChannelContext.SendToken, uses xbx xsi, pSecBuf:POINTER
+  SetObject xsi
+  mov xbx, pSecBuf
+  .if [xbx].SecBuffer.pvBuffer != NULL
+    .if [xbx].SecBuffer.cbBuffer != 0 && [xsi].pConnection != NULL
+      OCall [xsi].pConnection::NetComConnection.QueueSendRaw, \
+            [xbx].SecBuffer.pvBuffer, [xbx].SecBuffer.cbBuffer
+    .endif
+    invoke FreeContextBuffer, [xbx].SecBuffer.pvBuffer
+    mov [xbx].SecBuffer.pvBuffer, NULL
+    mov [xbx].SecBuffer.cbBuffer, 0
+  .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_SChannelContext.FreeToken
+; Purpose:    Releases an SSPI output token without sending it.
+; Arguments:  Arg1: -> SecBuffer.
+; Return:     Nothing.
+
+Method TLS_SChannelContext.FreeToken, uses xbx, pSecBuf:POINTER
+  mov xbx, pSecBuf
+  .if [xbx].SecBuffer.pvBuffer != NULL
+    invoke FreeContextBuffer, [xbx].SecBuffer.pvBuffer
+    mov [xbx].SecBuffer.pvBuffer, NULL
+    mov [xbx].SecBuffer.cbBuffer, 0
+  .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_SChannelContext.KeepExtra
+; Purpose:    Moves unconsumed input (SECBUFFER_EXTRA) to the start of the reassembly buffer and
+;             sets dReassemblyUsed accordingly. If there is no EXTRA buffer, all input was
+;             consumed and dReassemblyUsed is set to 0.
+; Arguments:  Arg1: -> SecBuffer that may have become SECBUFFER_EXTRA (InBuffers[1]).
+;             Arg2: -> Input data passed to ISC/ASC.
+;             Arg3: Input data size.
+; Return:     Nothing.
+; Note:       Must be called BEFORE AllocateBuffers may reallocate the reassembly buffer.
+
+Method TLS_SChannelContext.KeepExtra, uses xbx xsi, pExtraBuf:POINTER, pData:POINTER, dDataSize:DWORD
+  SetObject xsi
+  mov xbx, pExtraBuf
+  .if [xbx].SecBuffer.BufferType == SECBUFFER_EXTRA && [xbx].SecBuffer.cbBuffer != 0
+    ; Extra data is at (pData + dDataSize - ExtraBuffer.cbBuffer)
+    mov eax, [xbx].SecBuffer.cbBuffer
+    mov [xsi].dReassemblyUsed, eax
+    mov ecx, dDataSize
+    sub ecx, eax
+    mov xdx, pData
+    add xdx, xcx                                        ;xdx -> start of extra data
+    invoke MemShift, [xsi].pReassemblyBuffer, xdx, [xsi].dReassemblyUsed
+  .else
+    mov [xsi].dReassemblyUsed, 0                        ;All data consumed
+  .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     TLS_SChannelContext.ValidatePeer
+; Purpose:    Validates the peer certificate after a completed handshake. Fails closed:
+;             - Client: a server certificate and a validator are mandatory (SChannel does not
+;               validate anything itself because of ISC_REQ_MANUAL_CRED_VALIDATION). If
+;               bVerifyServerName is set, a target name is mandatory, too.
+;             - Server: only with bMutualAuth. Then a client certificate and a validator are
+;               mandatory; the certificate is checked with TLS_CertValidator.ValidateClient.
+; Arguments:  None.
+; Return:     eax = OBJ_OK or TLS_CERTIFICATE_INVALID (reason in dLastError).
+
+Method TLS_SChannelContext.ValidatePeer, uses xbx xsi
+  local pCertContext:POINTER, dResult:DWORD
+
+  SetObject xsi
+  mov pCertContext, NULL
+  mov dResult, TLS_CERTIFICATE_INVALID
+
+  .if [xsi].bIsClient == FALSE
+    ; --- Server side ---
+    .if [xsi].bMutualAuth == FALSE
+      mov dResult, OBJ_OK                               ;No client certificate requested
+      jmp @@Exit
+    .endif
+  .endif
+
+  ; A validator is mandatory
+  .if [xsi].pCertValidator == NULL
+    mov [xsi].dLastError, CERT_E_UNTRUSTEDROOT
+    jmp @@Exit
+  .endif
+
+  ; Get the peer certificate (it MUST exist)
+  lea xbx, [xsi].hSecurityContext
+  invoke QueryContextAttributesA, xbx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, addr pCertContext
+  .if eax != SEC_E_OK
+    mov [xsi].dLastError, eax
+    mov pCertContext, NULL
+    jmp @@Exit
+  .endif
+  .if pCertContext == NULL
+    mov [xsi].dLastError, SEC_E_CERT_UNKNOWN
+    jmp @@Exit
+  .endif
+
+  .if [xsi].bIsClient != FALSE
+    ; --- Client side: validate the server certificate ---
+    .if [xsi].bVerifyServerName != FALSE
+      .if [xsi].pTargetName == NULL
+        ; Hostname check requested, but no hostname known => fail closed
+        mov [xsi].dLastError, CERT_E_CN_NO_MATCH
+        jmp @@Exit
+      .endif
+      OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, [xsi].pTargetName
+    .else
+      OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, NULL
+    .endif
+  .else
+    ; --- Server side: validate the client certificate ---
+    OCall [xsi].pCertValidator::TLS_CertValidator.ValidateClient, pCertContext
+  .endif
+  .if eax != 0
+    mov [xsi].dLastError, eax
+  .else
+    mov dResult, OBJ_OK
+  .endif
+
+@@Exit:
+  .if pCertContext != NULL
+    invoke CertFreeCertificateContext, pCertContext
+  .endif
+  mov eax, dResult
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
 ; Method:     TLS_SChannelContext.ProcessHandshakeData
 ; Purpose:    Processes incoming handshake data. Branches based on bIsClient flag:
 ;             - Client (bIsClient=TRUE): Uses InitializeSecurityContext continuation calls.
 ;             - Server (bIsClient=FALSE): Uses AcceptSecurityContext.
 ;             Handles SEC_I_CONTINUE_NEEDED, SEC_E_OK, SEC_I_INCOMPLETE_CREDENTIALS,
 ;             SEC_E_INCOMPLETE_MESSAGE, SECBUFFER_EXTRA, and error conditions.
+;             On completion: peer validation (fail closed), stream sizes, buffers, state DATA.
+;             OnHandshakeComplete is only fired for the first handshake, not for
+;             renegotiations or TLS 1.3 post-handshake messages.
 ; Arguments:  Arg1: -> Handshake data received from peer.
 ;             Arg2: Data size in bytes.
 ;             Arg3: -> NetComConnection (for sending reply tokens and callbacks).
@@ -843,6 +1021,7 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   local OutBuffer:SecBuffer
   local OutBufferDesc:SecBufferDesc
   local dwSSPIOutFlags:DWORD
+  local dContextReq:DWORD
   local tsExpiry:TimeStamp
   local dStatus:DWORD
   local pCertContext:POINTER
@@ -850,20 +1029,23 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   local tsCredExpiry:TimeStamp
   local pSNIHostname:POINTER
   local dSNILen:DWORD
+  local bClientCertTried:DWORD
+  local dFailCode:DWORD
 
   SetObject xsi
 
   ; Store connection pointer
   m2m [xsi].pConnection, pConnection, xax
+  mov bClientCertTried, FALSE
 
   ; Branch: Client vs Server
   .if [xsi].bIsClient == FALSE
-    ; === SERVER PATH: AcceptSecurityContext ===
     jmp @@ServerPath
   .endif
 
-  ; === CLIENT PATH: InitializeSecurityContext continuation ===
-
+  ; ===========================================================================
+  ; CLIENT PATH: InitializeSecurityContext continuation
+  ; ===========================================================================
 @@RetryISC:
   ; --- Build input SecBufferDesc ---
   mov InBufferDesc.ulVersion, SECBUFFER_VERSION
@@ -881,21 +1063,20 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
   mov InBuffers[1 * sizeof SecBuffer].BufferType, SECBUFFER_EMPTY
   mov InBuffers[1 * sizeof SecBuffer].pvBuffer, NULL
 
-  ; --- Build output SecBufferDesc ---
+  ; --- Build output SecBufferDesc (SSPI allocates memory) ---
   mov OutBufferDesc.ulVersion, SECBUFFER_VERSION
   mov OutBufferDesc.cBuffers, 1
   lea xax, OutBuffer
   mov OutBufferDesc.pBuffers, xax
-
-  ; OutBuffer: Token type, SSPI allocates memory
   mov OutBuffer.cbBuffer, 0
   mov OutBuffer.BufferType, SECBUFFER_TOKEN
   mov OutBuffer.pvBuffer, NULL
 
-  ; --- Call InitializeSecurityContext (continuation - pass existing context) ---
+  ; --- Call InitializeSecurityContextA (continuation - pass existing context) ---
+  ; ANSI variant: pTargetName is always stored as ANSI (also in WIDE builds).
   lea xbx, [xsi].hCredential
   lea xdi, [xsi].hSecurityContext
-  invoke InitializeSecurityContext, \
+  invoke InitializeSecurityContextA, \
          xbx, \                               ; phCredential
          xdi, \                               ; phContext (existing context for continuation)
          [xsi].pTargetName, \                 ; pszTargetName (hostname for SNI)
@@ -908,143 +1089,46 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
          addr OutBufferDesc, \                ; pOutput
          addr dwSSPIOutFlags, \               ; pfContextAttr
          addr tsExpiry                        ; ptsExpiry
-
   mov dStatus, eax
 
-  ; --- Handle return codes ---
-
   .if dStatus == SEC_I_CONTINUE_NEEDED
-    ; --- SEC_I_CONTINUE_NEEDED: Send output token, wait for more data ---
-    .if OutBuffer.cbBuffer > 0 && OutBuffer.pvBuffer != NULL
-      OCall pConnection::NetComConnection.QueueSend, OutBuffer.pvBuffer, OutBuffer.cbBuffer
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
-
-    ; Handle SECBUFFER_EXTRA: preserve unconsumed data in reassembly buffer
-    .if InBuffers[1 * sizeof SecBuffer].BufferType == SECBUFFER_EXTRA
-      ; Extra data is at (pData + dDataSize - ExtraBuffer.cbBuffer)
-      mov eax, InBuffers[1 * sizeof SecBuffer].cbBuffer
-      mov xbx, pData
-      mov ecx, dDataSize
-      sub ecx, eax
-      add xbx, xcx                            ; xbx = start of extra data
-      ; Move extra data to the reassembly buffer start
-      mov [xsi].dReassemblyUsed, eax
-      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-    .else
-      ; All data consumed
-      mov [xsi].dReassemblyUsed, 0
-    .endif
-
+    ; --- Send output token, keep unconsumed data, wait for more ---
+    OCall xsi.SendToken, addr OutBuffer
+    lea xbx, InBuffers
+    add xbx, sizeof SecBuffer
+    OCall xsi.KeepExtra, xbx, pData, dDataSize
     mov eax, OBJ_OK
     jmp @@Exit
 
   .elseif dStatus == SEC_E_OK
-    ; --- SEC_E_OK: Handshake complete ---
-
-    ; Send final output token if any
-    .if OutBuffer.cbBuffer > 0 && OutBuffer.pvBuffer != NULL
-      OCall pConnection::NetComConnection.QueueSend, OutBuffer.pvBuffer, OutBuffer.cbBuffer
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
-
-    ; (a) QueryContextAttributes(SECPKG_ATTR_STREAM_SIZES) → fill StreamSizes
-    lea xbx, [xsi].hSecurityContext
-    lea xdi, [xsi].StreamSizes
-    invoke QueryContextAttributes, xbx, SECPKG_ATTR_STREAM_SIZES, xdi
-
-    ; (b) AllocateBuffers based on StreamSizes
-    OCall xsi.AllocateBuffers
-    .if eax != OBJ_OK
-      ; Buffer allocation failed - transition to error
-      mov [xsi].dState, TLS_STATE_ERROR
-      jmp @@HandshakeFailed
-    .endif
-
-    ; Publish max plaintext size to base class for polymorphic access
-    m2m [xsi].dMaxMessageSize, [xsi].StreamSizes.cbMaximumMessage, eax
-
-    ; (c) Set state to TLS_STATE_DATA, context is valid
-    mov [xsi].dState, TLS_STATE_DATA
-    mov [xsi].bContextValid, TRUE
-
-    ; (d) Validate peer certificate
-    mov pCertContext, NULL
-    lea xbx, [xsi].hSecurityContext
-    invoke QueryContextAttributes, xbx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, addr pCertContext
-
-    .if eax == SEC_E_OK && pCertContext != NULL
-      ; Delegate to CertValidator if one is set
-      .if [xsi].pCertValidator != NULL
-        ; Pass pTargetName for hostname verification if bVerifyServerName is TRUE
-        .if [xsi].bVerifyServerName == TRUE
-          OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, [xsi].pTargetName
-        .else
-          OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, NULL
-        .endif
-        .if eax != 0
-          ; (e) Validation failed: close connection
-          mov [xsi].dLastError, eax
-          mov [xsi].dState, TLS_STATE_ERROR
-          ; Call OnHandshakeFailed on the protocol
-          mov xbx, pConnection
-          mov xbx, [xbx].$Obj(NetComConnection).pProtocol
-          OCall xbx::NetComProtocol.OnError, pConnection, NULL, TLS_CERTIFICATE_INVALID
-          ; Close connection
-          OCall pConnection::NetComConnection.Disconnect, SD_BOTH
-          mov eax, TLS_CERTIFICATE_INVALID
-          jmp @@Exit
-        .endif
-      .endif
-    .endif
-
-    ; Handle SECBUFFER_EXTRA for handshake completion
-    .if InBuffers[1 * sizeof SecBuffer].BufferType == SECBUFFER_EXTRA
-      mov eax, InBuffers[1 * sizeof SecBuffer].cbBuffer
-      mov xbx, pData
-      mov ecx, dDataSize
-      sub ecx, eax
-      add xbx, xcx
-      mov [xsi].dReassemblyUsed, eax
-      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-    .else
-      mov [xsi].dReassemblyUsed, 0
-    .endif
-
-    ; (f) Call OnHandshakeComplete on the protocol
-    mov xbx, pConnection
-    mov xbx, [xbx].$Obj(NetComConnection).pProtocol
-    OCall xbx::NetComProtocol.OnHandshakeComplete, pConnection
-
-    mov eax, OBJ_OK
-    jmp @@Exit
+    ; --- Handshake complete ---
+    OCall xsi.SendToken, addr OutBuffer
+    lea xbx, InBuffers
+    add xbx, sizeof SecBuffer
+    OCall xsi.KeepExtra, xbx, pData, dDataSize        ;BEFORE AllocateBuffers (no use-after-free)
+    jmp @@HandshakeComplete
 
   .elseif dStatus == SEC_I_INCOMPLETE_CREDENTIALS
-    ; --- SEC_I_INCOMPLETE_CREDENTIALS: Server requests client certificate ---
+    ; --- Server requests a client certificate ---
+    OCall xsi.FreeToken, addr OutBuffer
 
-    ; Free output buffer if allocated
-    .if OutBuffer.pvBuffer != NULL
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
+    ; Only one attempt - avoid an endless loop if the server rejects our certificate
+    .if bClientCertTried != FALSE
+      mov [xsi].dLastError, TLS_CLIENT_CERT_NOT_PROVIDED
+      jmp @@HandshakeFailed
     .endif
+    mov bClientCertTried, TRUE
 
-    ; Check if we have a ClientCertProvider
     .if [xsi].pClientCertProvider == NULL
-      ; No provider set - fail with TLS_CLIENT_CERT_REQUIRED
-      mov [xsi].dState, TLS_STATE_ERROR
       mov [xsi].dLastError, TLS_CLIENT_CERT_REQUIRED
       jmp @@HandshakeFailed
     .endif
 
-    ; Get client certificate from provider
     OCall [xsi].pClientCertProvider::TLS_ClientCertProvider.GetClientCert
     .if xax == NULL
-      ; Provider returned NULL - fail with TLS_CLIENT_CERT_NOT_PROVIDED
-      mov [xsi].dState, TLS_STATE_ERROR
       mov [xsi].dLastError, TLS_CLIENT_CERT_NOT_PROVIDED
       jmp @@HandshakeFailed
     .endif
-
-    ; Store cert context for credential recreation
     mov pCertContext, xax
 
     ; Free existing credentials
@@ -1055,32 +1139,21 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
     .endif
 
     ; Recreate credentials with the client certificate
-    ; We need to rebuild SCHANNEL_CRED with the client cert
-    ; Since InitCredentials doesn't accept a cert parameter for client mode,
-    ; we do an inline AcquireCredentialsHandle here with the cert
-
-    ; Zero-initialize SCHANNEL_CRED
-    lea xbx, SchannelCred
-    xor eax, eax
-    mov ecx, sizeof SCHANNEL_CRED
-  @@ZeroCredLoop:
-    mov BYTE ptr [xbx + xcx - 1], 0
-    dec ecx
-    jnz @@ZeroCredLoop
-
+    invoke MemZero, addr SchannelCred, sizeof SCHANNEL_CRED
     mov SchannelCred.dwVersion, SCHANNEL_CRED_VERSION
     mov SchannelCred.cCreds, 1
     lea xax, pCertContext
     mov SchannelCred.paCred, xax
-    mov SchannelCred.dwFlags, SCH_USE_STRONG_CRYPTO
+    mov SchannelCred.dwFlags, SCH_CRED_NO_DEFAULT_CREDS or SCH_USE_STRONG_CRYPTO
+    mov SchannelCred.dwSessionLifespan, 1
     m2m SchannelCred.grBitEnabledProtocols, [xsi].dAllowedProtocols, eax
     m2m SchannelCred.palgSupportedAlgs, [xsi].pAllowedCipherSuites, xax
     m2m SchannelCred.cSupportedAlgs, [xsi].dCipherSuiteCount, eax
 
     lea xbx, [xsi].hCredential
-    invoke AcquireCredentialsHandle, \
+    invoke AcquireCredentialsHandleA, \
            NULL, \
-           $OfsCStr("Microsoft Unified Security Protocol Provider"), \
+           $OfsCStrA("Microsoft Unified Security Protocol Provider"), \
            SECPKG_CRED_OUTBOUND, \
            NULL, \
            addr SchannelCred, \
@@ -1088,11 +1161,13 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
            NULL, \
            xbx, \
            addr tsCredExpiry
+    mov dStatus, eax
 
-    .if eax != 0
-      ; Failed to recreate credentials with client cert
-      mov [xsi].dLastError, eax
-      mov [xsi].dState, TLS_STATE_ERROR
+    ; SChannel holds its own reference to the certificate
+    invoke CertFreeCertificateContext, pCertContext
+
+    .if dStatus != SEC_E_OK
+      m2m [xsi].dLastError, dStatus, eax
       jmp @@HandshakeFailed
     .endif
     mov [xsi].bCredentialValid, TRUE
@@ -1101,61 +1176,21 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
     jmp @@RetryISC
 
   .elseif dStatus == SEC_E_INCOMPLETE_MESSAGE
-    ; --- SEC_E_INCOMPLETE_MESSAGE: Need more data from server ---
-    ; Data remains in the reassembly buffer (passed as pData, dDataSize is dReassemblyUsed).
-    ; dReassemblyUsed stays unchanged � caller will append more data on next call.
-    ; Free output buffer if any
-    .if OutBuffer.pvBuffer != NULL
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
+    ; --- Need more data from server ---
+    ; dReassemblyUsed stays unchanged - caller will append more data on next call.
+    OCall xsi.FreeToken, addr OutBuffer
     mov eax, OBJ_OK
     jmp @@Exit
 
   .else
     ; --- Any other status: Handshake failed ---
-    ; NOTE: This handler covers both:
-    ;   - Protocol version rejection (Req 8.8): SChannel returns a handshake failure when the
-    ;     peer only supports protocol versions not in grBitEnabledProtocols (set via
-    ;     InitCredentials from dAllowedProtocols). No explicit check needed here.
-    ;   - Cipher-Suite mismatch (Req 8.9): SChannel returns SEC_E_ALGORITHM_MISMATCH
-    ;     (80090331h) when no common cipher suite exists between client and server.
-    ;     Both cases are caught here and propagated to OnHandshakeFailed via OnError.
-
-    ; Free output buffer if allocated
-    .if OutBuffer.pvBuffer != NULL
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
-
-    ; Check if ISC_RET_MUTUAL_AUTH is set in output flags (server wants mutual auth)
-    .ifBitSet dwSSPIOutFlags, ISC_RET_MUTUAL_AUTH
-      ; Server requests mutual auth - treat same as SEC_I_INCOMPLETE_CREDENTIALS
-      ; This branch handles the case where the handshake continued but flagged mutual auth
-      ; For now, fall through to error since the status indicates failure
-    .endif
-
-    ; Specific detection: SEC_E_ALGORITHM_MISMATCH (Req 8.9)
-    ; When no common cipher suite exists, SChannel returns this status.
-    ; dLastError preserves the original SECURITY_STATUS for diagnostics.
-;   .if dStatus == SEC_E_ALGORITHM_MISMATCH
-;     DbgWarning "TLS: No common cipher suite (SEC_E_ALGORITHM_MISMATCH)"
-;   .endif
-
+    ; Covers protocol version rejection and cipher suite mismatch (SEC_E_ALGORITHM_MISMATCH).
+    ; With ISC_REQ_EXTENDED_ERROR the output token may contain an alert for the peer.
+    OCall xsi.SendToken, addr OutBuffer
     m2m [xsi].dLastError, dStatus, eax
-    mov [xsi].dState, TLS_STATE_ERROR
-
-@@HandshakeFailed:
-;   DbgWarning "TLS: Handshake failed"
-    ; Notify protocol: OnError with TLS_HANDSHAKE_FAILED
-    ; The original SECURITY_STATUS is preserved in dLastError for TranslateError diagnostics.
-    mov xbx, pConnection
-    mov xbx, [xbx].$Obj(NetComConnection).pProtocol
-    OCall xbx::NetComProtocol.OnError, pConnection, NULL, TLS_HANDSHAKE_FAILED
-    ; Close connection
-    OCall pConnection::NetComConnection.Disconnect, SD_BOTH
-    mov eax, TLS_HANDSHAKE_FAILED
+    jmp @@HandshakeFailed
   .endif
 
-  jmp @@Exit
 
   ; ===========================================================================
   ; SERVER PATH: AcceptSecurityContext
@@ -1164,6 +1199,26 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
 
   ; --- SNI Extraction and Credential Initialization (first call only) ---
   .if [xsi].bCredentialValid == FALSE
+    ; SslGetServerIdentity needs the complete ClientHello record. Large ClientHellos (e.g. with
+    ; post-quantum key shares) often span several TCP segments => wait for the whole record,
+    ; otherwise the SNI is lost and the credentials are created for the wrong certificate.
+    ; dReassemblyUsed stays unchanged, OnReceivedTLS appends more data and calls again.
+    .if dDataSize < 5
+      mov eax, OBJ_OK
+      jmp @@Exit
+    .endif
+    mov xax, pData
+    .if BYTE ptr [xax] == 16h                           ;TLS handshake record
+      movzx ecx, BYTE ptr [xax + 3]                     ;Record length (big endian)
+      shl ecx, 8
+      mov cl, BYTE ptr [xax + 4]
+      add ecx, 5                                        ;+ record header
+      .if ecx <= TLS_MAX_RECORD_SIZE && ecx > dDataSize ;Oversized: let ASC reject it
+        mov eax, OBJ_OK
+        jmp @@Exit
+      .endif
+    .endif
+
     ; Extract SNI hostname from ClientHello using SslGetServerIdentity
     mov pSNIHostname, NULL
     mov dSNILen, 0
@@ -1174,226 +1229,162 @@ Method TLS_SChannelContext.ProcessHandshakeData, uses xbx xdi xsi, pData:POINTER
     ; Initialize server credentials with SNI info for certificate selection
     OCall xsi.InitCredentials, SECPKG_CRED_INBOUND, pSNIHostname, dSNILen
     .if eax != OBJ_OK
-      ; Credential initialization failed
       mov [xsi].dLastError, eax
-      mov [xsi].dState, TLS_STATE_ERROR
-      jmp @@ServerHandshakeFailed
+      jmp @@HandshakeFailed
     .endif
   .endif
 
-@@RetryASC:
   ; --- Build input SecBufferDesc for AcceptSecurityContext ---
   mov InBufferDesc.ulVersion, SECBUFFER_VERSION
   mov InBufferDesc.cBuffers, 2
   lea xax, InBuffers
   mov InBufferDesc.pBuffers, xax
 
-  ; InBuffer[0]: SECBUFFER_TOKEN with handshake data (already in reassembly buffer)
   m2m InBuffers[0 * sizeof SecBuffer].cbBuffer, dDataSize, eax
   mov InBuffers[0 * sizeof SecBuffer].BufferType, SECBUFFER_TOKEN
   m2m InBuffers[0 * sizeof SecBuffer].pvBuffer, pData, xax
 
-  ; InBuffer[1]: SECBUFFER_EMPTY (for SECBUFFER_EXTRA detection)
   mov InBuffers[1 * sizeof SecBuffer].cbBuffer, 0
   mov InBuffers[1 * sizeof SecBuffer].BufferType, SECBUFFER_EMPTY
   mov InBuffers[1 * sizeof SecBuffer].pvBuffer, NULL
 
-  ; --- Build output SecBufferDesc ---
+  ; --- Build output SecBufferDesc (SSPI allocates memory, ASC_REQ_ALLOCATE_MEMORY) ---
   mov OutBufferDesc.ulVersion, SECBUFFER_VERSION
   mov OutBufferDesc.cBuffers, 1
   lea xax, OutBuffer
   mov OutBufferDesc.pBuffers, xax
-
-  ; OutBuffer: Token type, SSPI allocates memory (ASC_REQ_ALLOCATE_MEMORY)
   mov OutBuffer.cbBuffer, 0
   mov OutBuffer.BufferType, SECBUFFER_TOKEN
   mov OutBuffer.pvBuffer, NULL
 
-  ; --- Determine server context flags ---
-  ; Base flags + mutual auth if CertValidator is set (server requires client cert)
+  ; --- Server context flags: request a client certificate only with mutual auth ---
   mov eax, TLS_SERVER_ASC_FLAGS
-  .if [xsi].pCertValidator != NULL
+  .if [xsi].bMutualAuth != FALSE
     or eax, ASC_REQ_MUTUAL_AUTH
   .endif
-  mov dwSSPIOutFlags, eax                       ; Reuse local for input flags
+  mov dContextReq, eax
 
   ; --- Call AcceptSecurityContext ---
   lea xbx, [xsi].hCredential
-  ; Use phContext = NULL on first call, existing context on continuation
+  lea xdi, [xsi].hSecurityContext
   .if [xsi].bContextValid == FALSE
     ; First call: phContext = NULL, phNewContext = &hSecurityContext
-    lea xdi, [xsi].hSecurityContext
     invoke AcceptSecurityContext, \
            xbx, \                               ; phCredential
            NULL, \                              ; phContext (NULL for first call)
            addr InBufferDesc, \                 ; pInput
-           dwSSPIOutFlags, \                    ; fContextReq
+           dContextReq, \                       ; fContextReq
            0, \                                 ; TargetDataRep (not used with stream)
            xdi, \                               ; phNewContext
            addr OutBufferDesc, \                ; pOutput
-           addr dwSSPIOutFlags, \               ; pfContextAttr (output flags reuse local)
+           addr dwSSPIOutFlags, \               ; pfContextAttr
            addr tsExpiry                        ; ptsExpiry
   .else
     ; Continuation call: phContext = &hSecurityContext
-    lea xdi, [xsi].hSecurityContext
     invoke AcceptSecurityContext, \
            xbx, \                               ; phCredential
            xdi, \                               ; phContext (existing context)
            addr InBufferDesc, \                 ; pInput
-           dwSSPIOutFlags, \                    ; fContextReq
+           dContextReq, \                       ; fContextReq
            0, \                                 ; TargetDataRep
            NULL, \                              ; phNewContext (NULL for continuation)
            addr OutBufferDesc, \                ; pOutput
            addr dwSSPIOutFlags, \               ; pfContextAttr
            addr tsExpiry                        ; ptsExpiry
   .endif
-
   mov dStatus, eax
 
-  ; --- Handle AcceptSecurityContext results ---
-
   .if dStatus == SEC_I_CONTINUE_NEEDED
-    ; --- SEC_I_CONTINUE_NEEDED: Mark context valid, send output token, wait for more ---
     mov [xsi].bContextValid, TRUE
-
-    .if OutBuffer.cbBuffer > 0 && OutBuffer.pvBuffer != NULL
-      OCall pConnection::NetComConnection.QueueSend, OutBuffer.pvBuffer, OutBuffer.cbBuffer
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
-
-    ; Handle SECBUFFER_EXTRA
-    .if InBuffers[1 * sizeof SecBuffer].BufferType == SECBUFFER_EXTRA
-      mov eax, InBuffers[1 * sizeof SecBuffer].cbBuffer
-      mov xbx, pData
-      mov ecx, dDataSize
-      sub ecx, eax
-      add xbx, xcx                            ; xbx = start of extra data
-      mov [xsi].dReassemblyUsed, eax
-      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-    .else
-      mov [xsi].dReassemblyUsed, 0
-    .endif
-
+    OCall xsi.SendToken, addr OutBuffer
+    lea xbx, InBuffers
+    add xbx, sizeof SecBuffer
+    OCall xsi.KeepExtra, xbx, pData, dDataSize
     mov eax, OBJ_OK
     jmp @@Exit
 
   .elseif dStatus == SEC_E_OK
-    ; --- SEC_E_OK: Server handshake complete ---
     mov [xsi].bContextValid, TRUE
-
-    ; Send final output token if any
-    .if OutBuffer.cbBuffer > 0 && OutBuffer.pvBuffer != NULL
-      OCall pConnection::NetComConnection.QueueSend, OutBuffer.pvBuffer, OutBuffer.cbBuffer
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
-
-    ; (a) QueryContextAttributes(SECPKG_ATTR_STREAM_SIZES) → fill StreamSizes
-    lea xbx, [xsi].hSecurityContext
-    lea xdi, [xsi].StreamSizes
-    invoke QueryContextAttributes, xbx, SECPKG_ATTR_STREAM_SIZES, xdi
-
-    ; (b) AllocateBuffers based on StreamSizes
-    OCall xsi.AllocateBuffers
-    .if eax != OBJ_OK
-      ; Buffer allocation failed
-      mov [xsi].dState, TLS_STATE_ERROR
-      jmp @@ServerHandshakeFailed
-    .endif
-
-    ; Publish max plaintext size to base class for polymorphic access
-    m2m [xsi].dMaxMessageSize, [xsi].StreamSizes.cbMaximumMessage, eax
-
-    ; (c) Set state to TLS_STATE_DATA
-    mov [xsi].dState, TLS_STATE_DATA
-
-    ; (d) Validate client certificate if mutual auth was requested
-    .if [xsi].pCertValidator != NULL
-      mov pCertContext, NULL
-      lea xbx, [xsi].hSecurityContext
-      invoke QueryContextAttributes, xbx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, addr pCertContext
-
-      .if eax == SEC_E_OK && pCertContext != NULL
-        OCall [xsi].pCertValidator::TLS_CertValidator.Validate, pCertContext, NULL
-        .if eax != 0
-          ; Client certificate validation failed
-          mov [xsi].dLastError, eax
-          mov [xsi].dState, TLS_STATE_ERROR
-          mov xbx, pConnection
-          mov xbx, [xbx].$Obj(NetComConnection).pProtocol
-          OCall xbx::NetComProtocol.OnError, pConnection, NULL, TLS_CERTIFICATE_INVALID
-          OCall pConnection::NetComConnection.Disconnect, SD_BOTH
-          mov eax, TLS_CERTIFICATE_INVALID
-          jmp @@Exit
-        .endif
-      .endif
-    .endif
-
-    ; Handle SECBUFFER_EXTRA for handshake completion
-    .if InBuffers[1 * sizeof SecBuffer].BufferType == SECBUFFER_EXTRA
-      mov eax, InBuffers[1 * sizeof SecBuffer].cbBuffer
-      mov xbx, pData
-      mov ecx, dDataSize
-      sub ecx, eax
-      add xbx, xcx
-      mov [xsi].dReassemblyUsed, eax
-      invoke MemShift, [xsi].pReassemblyBuffer, xbx, [xsi].dReassemblyUsed
-    .else
-      mov [xsi].dReassemblyUsed, 0
-    .endif
-
-    ; (e) Call OnHandshakeComplete on the protocol
-    mov xbx, pConnection
-    mov xbx, [xbx].$Obj(NetComConnection).pProtocol
-    OCall xbx::NetComProtocol.OnHandshakeComplete, pConnection
-
-    mov eax, OBJ_OK
-    jmp @@Exit
+    OCall xsi.SendToken, addr OutBuffer
+    lea xbx, InBuffers
+    add xbx, sizeof SecBuffer
+    OCall xsi.KeepExtra, xbx, pData, dDataSize        ;BEFORE AllocateBuffers (no use-after-free)
+    jmp @@HandshakeComplete
 
   .elseif dStatus == SEC_E_INCOMPLETE_MESSAGE
-    ; --- SEC_E_INCOMPLETE_MESSAGE: Need more data from client ---
-    ; Free output buffer if any
-    .if OutBuffer.pvBuffer != NULL
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
+    OCall xsi.FreeToken, addr OutBuffer
     mov eax, OBJ_OK
     jmp @@Exit
 
   .else
-    ; --- Any other status: Server handshake failed ---
-    ; NOTE: This handler covers both:
-    ;   - Protocol version rejection (Req 8.8): SChannel returns a handshake failure when the
-    ;     client only supports protocol versions not in grBitEnabledProtocols (set via
-    ;     InitCredentials from dAllowedProtocols). No explicit check needed here.
-    ;   - Cipher-Suite mismatch (Req 8.9): SChannel returns SEC_E_ALGORITHM_MISMATCH
-    ;     (80090331h) when no common cipher suite exists between client and server.
-    ;     Both cases are caught here and propagated to OnHandshakeFailed via OnError.
-
-    ; Free output buffer if allocated
-    .if OutBuffer.pvBuffer != NULL
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
-
-    ; Specific detection: SEC_E_ALGORITHM_MISMATCH (Req 8.9)
-    ; When no common cipher suite exists, SChannel returns this status.
-    ; dLastError preserves the original SECURITY_STATUS for diagnostics.
-;   .if dStatus == SEC_E_ALGORITHM_MISMATCH
-;     DbgWarning "TLS: No common cipher suite (SEC_E_ALGORITHM_MISMATCH)"
-;   .endif
-
+    ; Covers protocol version rejection and cipher suite mismatch (SEC_E_ALGORITHM_MISMATCH).
+    OCall xsi.SendToken, addr OutBuffer               ;Alert for the peer, if any
     m2m [xsi].dLastError, dStatus, eax
-    mov [xsi].dState, TLS_STATE_ERROR
+    jmp @@HandshakeFailed
+  .endif
 
-@@ServerHandshakeFailed:
-;   DbgWarning "TLS: Server handshake failed"
-    ; Notify protocol: OnError with TLS_HANDSHAKE_FAILED
-    ; The original SECURITY_STATUS is preserved in dLastError for TranslateError diagnostics.
+
+  ; ===========================================================================
+  ; Handshake complete (client and server)
+  ; ===========================================================================
+@@HandshakeComplete:
+  ; (a) Validate the peer certificate BEFORE the session becomes usable (fail closed)
+  OCall xsi.ValidatePeer
+  .if eax != OBJ_OK
+    mov dFailCode, TLS_CERTIFICATE_INVALID
+    jmp @@Fail
+  .endif
+
+  ; (b) QueryContextAttributes(SECPKG_ATTR_STREAM_SIZES) -> StreamSizes
+  lea xbx, [xsi].hSecurityContext
+  lea xdi, [xsi].StreamSizes
+  invoke QueryContextAttributesA, xbx, SECPKG_ATTR_STREAM_SIZES, xdi
+  .if eax != SEC_E_OK
+    mov [xsi].dLastError, eax
+    jmp @@HandshakeFailed
+  .endif
+
+  ; (c) Buffers based on StreamSizes (content of the reassembly buffer is preserved)
+  OCall xsi.AllocateBuffers
+  .if eax != OBJ_OK
+    mov [xsi].dLastError, eax
+    jmp @@HandshakeFailed
+  .endif
+
+  ; Publish max plaintext size to base class for polymorphic access
+  m2m [xsi].dMaxMessageSize, [xsi].StreamSizes.cbMaximumMessage, eax
+
+  ; (d) Session established
+  mov [xsi].dState, TLS_STATE_DATA
+
+  ; (e) Notify the protocol - only for the initial handshake
+  .if [xsi].bHandshakeDone == FALSE
+    mov [xsi].bHandshakeDone, TRUE
     mov xbx, pConnection
     mov xbx, [xbx].$Obj(NetComConnection).pProtocol
-    OCall xbx::NetComProtocol.OnError, pConnection, NULL, TLS_HANDSHAKE_FAILED
-    ; Close connection
-    OCall pConnection::NetComConnection.Disconnect, SD_BOTH
-    mov eax, TLS_HANDSHAKE_FAILED
+    OCall xbx::NetComProtocol.OnHandshakeComplete, pConnection
   .endif
+  mov eax, OBJ_OK
+  jmp @@Exit
+
+
+  ; ===========================================================================
+  ; Handshake failed (client and server)
+  ; ===========================================================================
+@@HandshakeFailed:
+  mov dFailCode, TLS_HANDSHAKE_FAILED
+@@Fail:
+  ; The original SECURITY_STATUS / HRESULT is preserved in dLastError (see TranslateError).
+  mov [xsi].dState, TLS_STATE_ERROR
+  mov xbx, pConnection
+  mov xbx, [xbx].$Obj(NetComConnection).pProtocol
+  OCall xbx::NetComProtocol.OnHandshakeFailed, pConnection, [xsi].dLastError
+  mov xbx, pConnection
+  mov xbx, [xbx].$Obj(NetComConnection).pProtocol
+  OCall xbx::NetComProtocol.OnError, pConnection, NULL, dFailCode
+  ; Close connection
+  OCall pConnection::NetComConnection.Disconnect, SD_BOTH
+  mov eax, dFailCode
 
 @@Exit:
 MethodEnd
@@ -1403,7 +1394,7 @@ MethodEnd
 ; Purpose:    Initiates a TLS client handshake.
 ;             Sets state to TLS_STATE_HANDSHAKE, initializes client credentials (anonymous),
 ;             calls InitializeSecurityContext (first call, no input buffer) to generate the
-;             initial handshake token, and sends it via NetComConnection.QueueSend.
+;             initial handshake token, and sends it via NetComConnection.QueueSendRaw.
 ; Arguments:  Arg1: -> NetComConnection.
 ; Return:     eax = OBJ_OK on success, error code on failure.
 
@@ -1417,31 +1408,32 @@ Method TLS_SChannelContext.StartClientHandshake, uses xbx xdi xsi, pConnection:P
 
   ; Set client mode flag
   mov [xsi].bIsClient, TRUE
+  mov [xsi].bHandshakeDone, FALSE
 
   ; Store connection pointer for later use in ProcessHandshakeData
   m2m [xsi].pConnection, pConnection, xax
 
-  ; Transition state: NONE → HANDSHAKE
+  ; Transition state: NONE -> HANDSHAKE
   mov [xsi].dState, TLS_STATE_HANDSHAKE
 
   ; Initialize client credentials (SECPKG_CRED_OUTBOUND, anonymous - no cert)
   OCall xsi.InitCredentials, SECPKG_CRED_OUTBOUND, NULL, 0
   .if eax != OBJ_OK
-    ; Credential initialization failed
     mov [xsi].dState, TLS_STATE_ERROR
     jmp @@Exit
   .endif
 
-  ; Allocate reassembly buffer early for handshake data accumulation
+  ; Allocate reassembly buffer early for handshake data accumulation.
+  ; It must hold at least one complete TLS record (header + 16K + expansion).
   .if [xsi].pReassemblyBuffer == NULL
-    MemAlloc TLS_HANDSHAKE_BUFFER_SIZE, MEM_INIT_ZERO
+    MemAlloc TLS_MAX_RECORD_SIZE, MEM_INIT_ZERO
     .if xax == NULL
       mov [xsi].dState, TLS_STATE_ERROR
       mov eax, TLS_BUFFER_ALLOC_FAILED
       jmp @@Exit
     .endif
     mov [xsi].pReassemblyBuffer, xax
-    mov [xsi].dReassemblyCapacity, TLS_HANDSHAKE_BUFFER_SIZE
+    mov [xsi].dReassemblyCapacity, TLS_MAX_RECORD_SIZE
     mov [xsi].dReassemblyUsed, 0
   .endif
 
@@ -1450,19 +1442,17 @@ Method TLS_SChannelContext.StartClientHandshake, uses xbx xdi xsi, pConnection:P
   mov OutBufferDesc.cBuffers, 1
   lea xax, OutBuffer
   mov OutBufferDesc.pBuffers, xax
-
-  ; Output buffer: Token type, SSPI allocates memory (ISC_REQ_ALLOCATE_MEMORY)
   mov OutBuffer.cbBuffer, 0
   mov OutBuffer.BufferType, SECBUFFER_TOKEN
   mov OutBuffer.pvBuffer, NULL
 
-  ; Call InitializeSecurityContext (first call - pContext=NULL, pInput=NULL)
+  ; Call InitializeSecurityContextA (first call - pContext=NULL, pInput=NULL)
   lea xbx, [xsi].hCredential
   lea xdi, [xsi].hSecurityContext
-  invoke InitializeSecurityContext, \
+  invoke InitializeSecurityContextA, \
          xbx, \                               ; phCredential
          NULL, \                              ; phContext (NULL for first call)
-         [xsi].pTargetName, \                 ; pszTargetName (hostname for SNI, or NULL)
+         [xsi].pTargetName, \                 ; pszTargetName (ANSI hostname for SNI, or NULL)
          TLS_CLIENT_ISC_FLAGS or ISC_REQ_ALLOCATE_MEMORY, \ ; fContextReq
          0, \                                 ; Reserved1
          0, \                                 ; TargetDataRep (not used with stream)
@@ -1473,23 +1463,16 @@ Method TLS_SChannelContext.StartClientHandshake, uses xbx xdi xsi, pConnection:P
          addr dwSSPIOutFlags, \               ; pfContextAttr
          addr tsExpiry                        ; ptsExpiry
 
-  ; Check result
   .if eax == SEC_I_CONTINUE_NEEDED || eax == SEC_E_OK
     ; Context handle is now valid
     mov [xsi].bContextValid, TRUE
-
-    ; If output token was generated (cbBuffer > 0), send it
-    .if OutBuffer.cbBuffer > 0 && OutBuffer.pvBuffer != NULL
-      OCall pConnection::NetComConnection.QueueSend, OutBuffer.pvBuffer, OutBuffer.cbBuffer
-      ; Free SSPI-allocated output buffer
-      invoke FreeContextBuffer, OutBuffer.pvBuffer
-    .endif
-
+    OCall xsi.SendToken, addr OutBuffer               ;ClientHello
     mov eax, OBJ_OK
   .else
     ; InitializeSecurityContext failed on first call
     mov [xsi].dLastError, eax
     mov [xsi].dState, TLS_STATE_ERROR
+    OCall xsi.FreeToken, addr OutBuffer
     mov eax, TLS_HANDSHAKE_FAILED
   .endif
 
@@ -1513,6 +1496,7 @@ Method TLS_SChannelContext.StartServerHandshake, uses xbx xsi, pConnection:POINT
 
   ; Set server mode flag
   mov [xsi].bIsClient, FALSE
+  mov [xsi].bHandshakeDone, FALSE
 
   ; Store connection pointer for later use in ProcessHandshakeData
   m2m [xsi].pConnection, pConnection, xax
@@ -1524,16 +1508,17 @@ Method TLS_SChannelContext.StartServerHandshake, uses xbx xsi, pConnection:POINT
   ; Credentials will be created after extracting SNI from the ClientHello,
   ; allowing GetServerCert to receive the hostname for multi-vhost selection.
 
-  ; Allocate reassembly buffer early for handshake data accumulation
+  ; Allocate reassembly buffer early for handshake data accumulation.
+  ; It must hold at least one complete TLS record (header + 16K + expansion).
   .if [xsi].pReassemblyBuffer == NULL
-    MemAlloc TLS_HANDSHAKE_BUFFER_SIZE, MEM_INIT_ZERO
+    MemAlloc TLS_MAX_RECORD_SIZE, MEM_INIT_ZERO
     .if xax == NULL
       mov [xsi].dState, TLS_STATE_ERROR
       mov eax, TLS_BUFFER_ALLOC_FAILED
       jmp @@Exit
     .endif
     mov [xsi].pReassemblyBuffer, xax
-    mov [xsi].dReassemblyCapacity, TLS_HANDSHAKE_BUFFER_SIZE
+    mov [xsi].dReassemblyCapacity, TLS_MAX_RECORD_SIZE
     mov [xsi].dReassemblyUsed, 0
   .endif
 
@@ -1549,7 +1534,7 @@ MethodEnd
 ; Purpose:    Initiates TLS shutdown sequence.
 ;             Applies the SCHANNEL_SHUTDOWN control token to the security context, then calls
 ;             InitializeSecurityContext (client) or AcceptSecurityContext (server) to generate
-;             the shutdown token. The token is sent to the peer via QueueSend, and the state
+;             the shutdown token. The token is sent to the peer via QueueSendRaw, and the state
 ;             transitions to TLS_STATE_SHUTDOWN.
 ; Arguments:  Arg1: -> NetComConnection.
 ; Return:     eax = OBJ_OK on success, TLS_HANDSHAKE_FAILED on failure.
@@ -1562,6 +1547,13 @@ Method TLS_SChannelContext.Shutdown, uses xbx xdi xsi, pConnection:POINTER
   local dOutAttrs:DWORD
 
   SetObject xsi
+
+  ; Guard: Without a security context there is nothing to shut down
+  .if [xsi].bContextValid == FALSE
+    mov [xsi].dState, TLS_STATE_SHUTDOWN
+    mov eax, OBJ_OK
+    jmp @@Exit
+  .endif
 
   ; Guard: If state is already TLS_STATE_SHUTDOWN (set by DecryptMessage on
   ; SEC_I_CONTEXT_EXPIRED when peer sent close_notify), skip ApplyControlToken.
@@ -1617,7 +1609,7 @@ Method TLS_SChannelContext.Shutdown, uses xbx xdi xsi, pConnection:POINTER
     ; Client: use InitializeSecurityContext
     lea xbx, [xsi].hSecurityContext
     lea xdi, [xsi].hCredential
-    invoke InitializeSecurityContext, \
+    invoke InitializeSecurityContextA, \
            xdi, \                     ; phCredential
            xbx, \                     ; phContext (existing)
            NULL, \                    ; pszTargetName
@@ -1646,18 +1638,11 @@ Method TLS_SChannelContext.Shutdown, uses xbx xdi xsi, pConnection:POINTER
            addr tsExpiry              ; ptsExpiry
   .endif
 
-  ; If output token was generated, send it to the peer
-  .if OutBuffer.cbBuffer > 0 && OutBuffer.pvBuffer != NULL
-    ; Set state to SHUTDOWN BEFORE QueueSend so the token bypasses encryption
-    mov [xsi].dState, TLS_STATE_SHUTDOWN
-    ; Send shutdown token via QueueSend (passes through as raw data like handshake tokens)
-    OCall pConnection::NetComConnection.QueueSend, OutBuffer.pvBuffer, OutBuffer.cbBuffer
-    ; Free the allocated output buffer (SSPI allocated it with ISC_REQ_ALLOCATE_MEMORY)
-    invoke FreeContextBuffer, OutBuffer.pvBuffer
-  .else
-    ; No token generated, just set state
-    mov [xsi].dState, TLS_STATE_SHUTDOWN
-  .endif
+  ; No more application data from now on, then send the close_notify token (unencrypted,
+  ; it is already protected by SChannel) and free it
+  mov [xsi].dState, TLS_STATE_SHUTDOWN
+  m2m [xsi].pConnection, pConnection, xax
+  OCall xsi.SendToken, addr OutBuffer
 
   mov eax, OBJ_OK
 
@@ -1678,6 +1663,7 @@ Method TLS_SChannelContext.InitCredentials, uses xbx xsi, dUsage:DWORD, pSNIHost
   local SchannelCred:SCHANNEL_CRED
   local pCertContext:POINTER
   local tsExpiry:TimeStamp
+  local dACHStatus:DWORD
 
   SetObject xsi
 
@@ -1748,9 +1734,9 @@ Method TLS_SChannelContext.InitCredentials, uses xbx xsi, dUsage:DWORD, pSNIHost
 
   ; Call AcquireCredentialsHandle
   lea xbx, [xsi].hCredential
-  invoke AcquireCredentialsHandle, \
+  invoke AcquireCredentialsHandleA, \
          NULL, \                              ; pszPrincipal
-         $OfsCStr("Microsoft Unified Security Protocol Provider"), \ ; pszPackage (UNISP_NAME)
+         $OfsCStrA("Microsoft Unified Security Protocol Provider"), \ ; pszPackage (UNISP_NAME_A)
          dUsage, \                            ; fCredentialUse
          NULL, \                              ; pvLogonID
          addr SchannelCred, \                 ; pAuthData
@@ -1759,7 +1745,15 @@ Method TLS_SChannelContext.InitCredentials, uses xbx xsi, dUsage:DWORD, pSNIHost
          xbx, \                               ; phCredential
          addr tsExpiry                        ; ptsExpiry
 
-  ; Check result (SECURITY_STATUS in eax, SEC_E_OK = 0)
+  mov dACHStatus, eax
+
+  ; SChannel holds its own reference to the server certificate => release ours
+  .if pCertContext != NULL
+    invoke CertFreeCertificateContext, pCertContext
+  .endif
+
+  ; Check result (SECURITY_STATUS, SEC_E_OK = 0)
+  mov eax, dACHStatus
   .if eax == 0
     mov [xsi].bCredentialValid, TRUE
     mov eax, OBJ_OK
