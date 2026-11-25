@@ -1,0 +1,9 @@
+# Build output of the ObjAsm build chain (assembler, resource compiler, linker, logs).
+# Already tracked files (e.g. Code/Lib/*/Lua/Debug/Lua546.pdb) stay tracked.
+*.obj
+*.pdb
+*.res
+*.log
+
+# Visual Studio solution cache
+.vs/

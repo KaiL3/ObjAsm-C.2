@@ -1,7 +1,7 @@
 ; ==================================================================================================
 ; Title:      NetCom.inc
 ; Author:     G. Friedrich
-; Version:    C.1.0
+; Version:    C.1.1
 ; Purpose:    ObjAsm object cluster. Support of NetCom objects.
 ; Links:      - http://www.codeproject.com/KB/IP/jbsocketserver3.aspx
 ;             - http://msdn.microsoft.com/en-us/library/ms741394(VS.85).aspx
@@ -39,6 +39,11 @@
 ;
 ;             ServiceNames: look at %WINDIR%\system32\drivers\etc\services
 ;
+;             Version C.1.1, November 2026
+;               - NetComSupervisor: dHandshakeTimeout (TLS initial handshake deadline).
+;               - NetComProtocol: dMaxRcvBuffered (receive limit per connection).
+;               - NetComConnection: PauseReceive/ResumeReceive (receive flow control), PauseTime.
+;               - NetComSupervisor: dRcvPauseTimeout.
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -176,6 +181,8 @@ AddErrMsg NCCN_OUT_OF_MEMORY,               "Out of memory in NetComConnection"
 AddErrMsg NCCN_DISCONNECTED,                "NetComConnection disconnected"
 
 AddErrMsg NCSP_OUT_OF_MEMORY,               "Out of memory in NetComSvrProtocol"
+AddErrMsg NCCN_RCV_LIMIT_EXCEEDED,          "NetComConnection receive limit exceeded"
+AddErrMsg NCCN_RCV_PAUSE_TIMEOUT,           "NetComConnection receive pause timeout"
 
 ;WSA GUIDs
 WSAID_CONNECTEX            GUID {025A207B9h,0DDF3h,04660h,{08Eh,0E9h,076h,0E5h,08Ch,074h,006h,03Eh}}
@@ -388,6 +395,7 @@ DEFAULT_LISTENING_PORT  equ $htons(25773)
 ;Defaults (can be changed at runtime via your UI/init paths)
 TX_HIGH_WM_DEFAULT      equ 1024
 TX_LOW_WM_DEFAULT       equ 512
+RCV_LIMIT_DEFAULT       equ 1024*1024           ;Max. unconsumed received BYTEs per connection
 
 ; --------------------------------------------------------------------------------------------------
 ; Object:  NetComIOJobPool
@@ -440,10 +448,20 @@ Object NetComConnection, NetComConnectionID, Primer
   VirtualMethod   DoRcvIOJob,         PIOJOB
   VirtualMethod   DoSndIOJob,         PIOJOB
 
+  ;Receive limit (NetComProtocol.dMaxRcvBuffered)
+  StaticMethod    CheckRcvLimit                         ;Aborts the connection if exceeded
+
+  ;Receive flow control: while paused, no WSARecv is posted => TCP throttles the peer
+  StaticMethod    PauseReceive
+  StaticMethod    ResumeReceive
+
   ;TLS internal helpers (not intended for external use)
   StaticMethod    OnReceivedTLS,      PIOJOB            ;TLS state-machine for received data
   StaticMethod    QueueSendTLS,       POINTER, DWORD    ;TLS encrypt and send
   StaticMethod    ApplyTLSConfig,     POINTER           ;Apply TLS_Connection_Config to pTLSContext
+  StaticMethod    QueueSendRaw,       POINTER, DWORD    ;Unencrypted send (non-TLS data, TLS tokens)
+  StaticMethod    FlushPendingTLS                       ;Encrypt+send data queued during handshake
+  StaticMethod    DeliverPlaintext,   POINTER, DWORD    ;Hand decrypted data to the protocol
 
   ;Networking stuff
   DefineVariable  dFlags,             DWORD,            0
@@ -457,6 +475,7 @@ Object NetComConnection, NetComConnectionID, Primer
   DefineVariable  RemoteAddr,         NETCOMADDR,       {AF_INETX}  ;IP + Port
   DefineVariable  StartTime,          FILETIME,         {}
   DefineVariable  LastTime,           FILETIME,         {}
+  DefineVariable  PauseTime,          FILETIME,         {}    ;Start of the receive pause
 
   ;Backpressure Metric
   DefineVariable  dSndHighWtrMrk,     DWORD,            TX_HIGH_WM_DEFAULT
@@ -467,6 +486,7 @@ Object NetComConnection, NetComConnectionID, Primer
   ;Management
   DefineVariable  pTLSContext,        POINTER,          NULL  ;-> TLS_Context or NULL
   DefineVariable  PlaintextChain,     SDLL_SENTINEL,    {NULL, NULL}  ;Decrypted data chain (TLS only)
+  DefineVariable  PendingSendChain,   SDLL_SENTINEL,    {NULL, NULL}  ;Plaintext held back until the TLS handshake is complete
   DefineVariable  pData,              POINTER,          NULL  ;-> Data managed by the protocol
   DefineVariable  dDisconnectError,   DWORD,            0     ;Error-Code fùr async OnDisconnected
   DefineVariable  dDisconnectDirection, DWORD,          0     ;Direction fùr async OnDisconnected (SD_xxx)
@@ -544,6 +564,12 @@ Object NetComProtocol, NetComProtocolID, Primer
   DefineVariable  dTimeoutRcv,        DWORD,      0           ;Receive
   DefineVariable  dTimeoutSnd,        DWORD,      0           ;Send - not implementd yet
 
+  ;Max. number of received BYTEs per connection that the protocol has not consumed yet
+  ;(completed IOJobs in RcvIOJobChain + PlaintextChain). Exceeding it aborts the connection and
+  ;reports NCCN_RCV_LIMIT_EXCEEDED via OnError. 0 means no limit. Set it to at least the size of
+  ;the largest message the protocol has to buffer before it can consume it.
+  DefineVariable  dMaxRcvBuffered,    DWORD,      RCV_LIMIT_DEFAULT
+
   Embed BlackList, NetComAddrCollection                 ;Addr-List that are not allowed to connect
 ObjectEnd
 
@@ -606,6 +632,14 @@ Object NetComSupervisor, NetComSupervisorID, Primer
 
   ;TLS Shutdown timeout: max wait time for peer close_notify response
   DefineVariable  dTLSShutdownTimeout, DWORD,     5*10000000  ;5 seconds in 100ns units
+
+  ;TLS handshake timeout: max time from StartTime until the initial handshake is complete.
+  ;0 means no timeout. Counted from StartTime, not from the last activity (slow trickle).
+  DefineVariable  dHandshakeTimeout,  DWORD,      15*10000000 ;15 seconds in 100ns units
+
+  ;Receive pause timeout: max time a connection may stay paused (PauseReceive). A paused
+  ;connection is excluded from the inactivity timeout. 0 means no timeout.
+  DefineVariable  dRcvPauseTimeout,   DWORD,      60*10000000 ;60 seconds in 100ns units
 ObjectEnd
 
 
