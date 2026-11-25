@@ -1,0 +1,53 @@
+; ==================================================================================================
+; Title:      NetComTLSServer.rc
+; Author:     Kai Liebenau
+; Version:    See NetComTLSServer.asm
+; Purpose:    NetCom TLS Server resource file.
+; ==================================================================================================
+
+
+#include "Resource.h"                   //Windows resource definitions
+#include "NetComTLSServer_Shared.rc"    //Application shared definitions
+#include "VER\Version.rc"               //Application version definition
+#include "MFT\Manifest_Invoker.rc"      //Application manifest definition
+
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+
+
+// Icons ------------------------------------------------------------------------------------------
+ICON_APP  ICON DISCARDABLE "ICO\OA.ico"
+
+
+// Bitmaps ----------------------------------------------------------------------------------------
+BMP_BACKGROUND  BITMAP "BMP\WndBkgnd.bmp"
+
+
+// Dialogs ----------------------------------------------------------------------------------------
+#include "DLG\DialogAbout.rc"
+#include "..\TLS_TestSettingsDlg.rc"
+
+
+// Menus ------------------------------------------------------------------------------------------
+MENU_APP MENUEX DISCARDABLE
+BEGIN
+  POPUP "&File", 0, MFT_STRING,   MFS_ENABLED
+  BEGIN
+    MENUITEM "&Settings...", IDM_SETTINGS, MFT_STRING, MFS_ENABLED
+    MENUITEM "", 0, MFT_SEPARATOR
+    MENUITEM "&Exit", IDM_EXIT,   MFT_STRING, MFS_ENABLED
+  END
+  POPUP "&Actions", 0, MFT_STRING, MFS_ENABLED
+  BEGIN
+    MENUITEM "&Pause receive (all)", IDM_PAUSE, MFT_STRING, MFS_ENABLED
+    MENUITEM "&Resume receive (all)", IDM_RESUME, MFT_STRING, MFS_ENABLED
+    MENUITEM "&Disconnect all (graceful)", IDM_DISCONNECT, MFT_STRING, MFS_ENABLED
+    MENUITEM "&Abort all (RST)", IDM_ABORT, MFT_STRING, MFS_ENABLED
+    MENUITEM "", 0, MFT_SEPARATOR
+    MENUITEM "Reset &statistics", IDM_RESET_STATS, MFT_STRING, MFS_ENABLED
+  END
+  POPUP "&Help", 0, MFT_STRING,   MFS_ENABLED
+  BEGIN
+    MENUITEM "&Help",  IDM_HELP,  MFT_STRING, MFS_ENABLED
+    MENUITEM "&About", IDM_ABOUT, MFT_STRING, MFS_ENABLED
+  END
+END
