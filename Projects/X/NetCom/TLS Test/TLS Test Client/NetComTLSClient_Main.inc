@@ -130,7 +130,7 @@ Method NetComTLSClient.Init, uses xsi
   invoke UpdateWindow, [xsi].hWnd
 
   OCall [xsi].Client::NetComEngine.Init, xsi, offset $ObjTmpl(NetComSupervisor), \
-                                              5, 5, MSS_ETHERNET_IPVX
+                                              5, 5, TT_IOJOB_BUFFER_SIZE
   OCall $ObjTmpl(NetComTLSClientProtocol)::NetComTLSClientProtocol.Init, xsi
   ;Timeouts and receive limit from the settings
   invoke TestApplyNetCom, offset $ObjTmpl(NetComSupervisor), offset $ObjTmpl(NetComTLSClientProtocol)

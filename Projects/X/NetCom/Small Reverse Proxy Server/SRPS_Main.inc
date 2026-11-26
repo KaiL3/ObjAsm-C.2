@@ -557,7 +557,7 @@ Method Application.Init, uses xbx xsi
     .endif
   .endif
   OCall [xsi].RevProxy::NetComEngine.Init, xsi, offset $ObjTmpl(NetComSrpsSupervisor), \
-                                           50, 1000, MSS_ETHERNET_IPVX ;Init network engine
+                                           50, 1000, SRPS_IOJOB_BUFFER_SIZE ;Init network engine
   .if eax != 0
     invoke MessageBox, [xsi].hWnd, $OfsCStr("Failed to start the NetCom engine"), \
                        addr cError, MB_OK or MB_ICONERROR ;Show error

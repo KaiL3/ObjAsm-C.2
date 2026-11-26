@@ -34,6 +34,9 @@ TT_SCOPE_LOCAL_MACHINE  equ   1
 TT_MAX_SECONDS          equ   429                       ;Max. seconds in 100ns units in a DWORD
 TT_MAX_LIMIT_KB         equ   4194303                   ;Max. KB that fit in a DWORD as BYTEs
 TT_MAX_CIPHERS          equ   32                        ;Max. ALG_IDs in the cipher list
+;IOJob buffer size of the test engines: a full TLS record (16 KB plaintext + header/trailer)
+;fits into one IOJob, and a WSARecv fetches up to this many BYTEs at once.
+TT_IOJOB_BUFFER_SIZE    equ   16*1024 + 1024
 TT_MAX_CERT_BYTES       equ   64                        ;Max. bytes of a thumbprint / serial
 TT_STORE_LEN            equ   64                        ;Characters incl. ZTC
 TT_TEXT_LEN             equ   256                       ;Characters incl. ZTC

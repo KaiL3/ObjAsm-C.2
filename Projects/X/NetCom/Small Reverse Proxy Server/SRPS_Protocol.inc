@@ -34,6 +34,14 @@ DEFAULT_SERVER_LISTENING_PORT equ $htons(25773)
 
 SRPS_DEFAULT_LISTENING_PORT equ $htons(25772)
 
+;IOJob buffer size of the proxy engine. A WSARecv returns at most this many BYTEs, so larger
+;buffers move stream data with far fewer IO operations than MSS sized ones.
+SRPS_IOJOB_BUFFER_SIZE      equ 16*1024
+;Send queue watermarks in IOJobs (backpressure, see ProcessData / OnSendQueueLow):
+;about 1 MB in flight per direction pauses the source, about 512 KB resumes it.
+SRPS_SND_HIGH_WM            equ (1024*1024)/SRPS_IOJOB_BUFFER_SIZE
+SRPS_SND_LOW_WM             equ SRPS_SND_HIGH_WM/2
+
 SND_MAX_RETRIES   equ   5
 SND_DELAY_BASE    equ   100
 ;TX_DELAY = doubled each retry
@@ -92,6 +100,9 @@ Method NetComSrpsProtocol.Allocate,, pConnection:$ObjPtr(NetComConnection)
   .if xax != NULL
     mov xcx, pConnection
     mov [xcx].$Obj(NetComConnection).pData, xax
+    ;Watermarks count IOJobs: adapt them to the IOJob size of this engine
+    mov [xcx].$Obj(NetComConnection).dSndHighWtrMrk, SRPS_SND_HIGH_WM
+    mov [xcx].$Obj(NetComConnection).dSndLowWtrMrk, SRPS_SND_LOW_WM
     xor eax, eax
   .else
     OCall ErrorReport, NULL, WSA_NOT_ENOUGH_MEMORY

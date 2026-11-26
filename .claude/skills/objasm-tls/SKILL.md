@@ -93,6 +93,12 @@ NetCom does **not** create or free TLS contexts. In the protocol object:
   there; without it a peer that never answers close_notify keeps the connection forever. Since
   NetComSupervisor C.1.1 accepted server connections are supervised too, so a server needs a
   sensible `dInactivityTimeout` (default 10 s) set on the template before `NetComEngine.Init`.
+- IOJob buffer size (last argument of `NetComEngine.Init`): use at least 16 KB + 1 KB for TLS
+  instead of `MSS_ETHERNET_IPVX`, so a full TLS record (16 KB plaintext + header/trailer) fits into
+  one IOJob and a WSARecv fetches up to a record at once (TLS Test: `TT_IOJOB_BUFFER_SIZE`). With
+  1460 B every record took 12 sends, the TLS server needed ~40 % more CPU and a proxy chain half the
+  throughput. The send watermarks count IOJobs, so adapt `dSndHighWtrMrk`/`dSndLowWtrMrk` to the
+  buffer size where they matter (SRPS sets them per connection in Allocate).
 - Receive limit: `NetComProtocol.dMaxRcvBuffered` (default 1 MB, 0 = off) caps the unconsumed bytes
   per connection (RcvIOJobChain + PlaintextChain); exceeding it aborts the connection with
   `OnError(NCCN_RCV_LIMIT_EXCEEDED)`. Set it on the protocol (template or instance) to at least the

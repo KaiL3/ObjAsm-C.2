@@ -91,7 +91,7 @@ Method NetComTLSServer.Init, uses xsi
 
   ;Initialize NetCom engine
   OCall [xsi].Server::NetComEngine.Init, xsi, offset $ObjTmpl(NetComSupervisor), \
-                                              50, 1000, MSS_ETHERNET_IPVX
+                                              50, 1000, TT_IOJOB_BUFFER_SIZE
   .if eax == 0
     ;Initialize server protocol
     OCall $ObjTmpl(NetComTLSServerProtocol)::NetComTLSServerProtocol.Init, xsi
