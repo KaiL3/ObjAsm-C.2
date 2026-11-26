@@ -62,6 +62,8 @@
 ;               - NetComConnection: the CritSect is used through pCritSect; NewPartner creates a
 ;                 connection that shares the CritSect of another one (e.g. both sides of a proxy
 ;                 pair: one thread at a time per pair, no lock cycles between them).
+;               - NetComProtocol.OnSendQueueLow: called once when the send queue of a connection
+;                 has drained to dSndLowWtrMrk after it had reached dSndHighWtrMrk (backpressure).
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -174,6 +176,7 @@ NCC_CLOSED_DELIVERED        equ   BIT16     ;OnClosed wurde an Protocol geliefer
 ;Backpressure control
 NCC_RCV_PAUSED              equ   BIT24
 NCC_SND_PAUSED              equ   BIT25
+NCC_SND_QUEUE_HIGH          equ   BIT26     ;Send queue reached dSndHighWtrMrk => OnSendQueueLow follows
 
 ;NetCom Error states
 NCE_ACCEPT                  equ   BIT27     ;Error happend while accepting
@@ -456,6 +459,7 @@ Object NetComConnection, NetComConnectionID, Primer
   VirtualMethod   QueueDestroy
   StaticMethod    ReadyToDestroy?                       ;Destruction check (CritSect held)
   StaticMethod    NewPartner,         POINTER           ;-> Protocol; shares this CritSect
+  StaticMethod    CheckSndQueueLow                      ;Protocol.OnSendQueueLow when drained
 
   ;Methods to place IO socket jobs or messages on the IOCP queue
   VirtualMethod   QueueAccept,        PLISTENER               ;-> Listener
@@ -579,6 +583,7 @@ Object NetComProtocol, NetComProtocolID, Primer
   VirtualMethod   OnHandshakeComplete,$ObjPtr(NetComConnection)
   VirtualMethod   OnHandshakeFailed,  $ObjPtr(NetComConnection), DWORD  ;dErrorCode
   VirtualMethod   OnConfigureTLS,     $ObjPtr(NetComConnection)         ;Return: xax -> TLS_Connection_Config or NULL
+  VirtualMethod   OnSendQueueLow,     $ObjPtr(NetComConnection)         ;Send queue drained
   VirtualMethod   OnTimeouted,        $ObjPtr(NetComConnection)
   VirtualMethod   ProcessData,        $ObjPtr(NetComConnection), DWORD ;-> NetComConnection, Index
   VirtualMethod   Release,            $ObjPtr(NetComConnection)

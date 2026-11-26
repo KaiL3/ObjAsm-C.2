@@ -15,6 +15,8 @@
 ;               - ReadyToDestroy?: destruction check under the CritSect, closes the connection
 ;                 first if necessary (FreeRessources must not post completions).
 ;               - OnAccepted: no new acceptor on a closed listener.
+;               - DoSndIOJob/OnSent/CheckSndQueueLow: Protocol.OnSendQueueLow once the send queue
+;                 drained to dSndLowWtrMrk after it had reached dSndHighWtrMrk.
 ;               - All locking goes through pCritSect (own CritSect, or the lock owner's for a
 ;                 partner created with NewPartner). Init sets it once, it never changes. Done still
 ;                 deletes the own CritSect; FreeRessources of a partner releases the lock owner
@@ -362,6 +364,11 @@ Method NetComConnection.DoSndIOJob, uses xbx xdi xsi, pIOJob:PIOJOB
   .if eax == 0
     inc [xsi].dPendingIOJobs
     inc [xsi].dSndQueuedIOJobs
+    ;Remember that the send queue was high: OnSendQueueLow follows when it has drained
+    mov ecx, [xsi].dSndQueuedIOJobs
+    .if ecx >= [xsi].dSndHighWtrMrk
+      BitSet [xsi].dFlags, NCC_SND_QUEUE_HIGH
+    .endif
   .endif
   mov ebx, eax
 
@@ -893,18 +900,34 @@ MethodEnd
 Method NetComConnection.OnSent, uses xsi, pIOJob:PIOJOB
   SetObject xsi
 ;  DbgText "NetComConnection.OnSent", addr [xsi].wName
-  ?mov xdx, pIOJob
   dec [xsi].dSndQueuedIOJobs
 
-  ;If below Low-WM => clear block
-  mov eax, [xsi].dSndQueuedIOJobs
-  .if eax < [xsi].dSndLowWtrMrk
-    BitClr [xsi].dFlags, NCC_SND_PAUSED
-  .endif
-
-  ;Toss the completed IOJob back in the IOJobPool
+  ;Toss the completed IOJob back in the IOJobPool (the protocol may send again below)
   mov xax, [xsi].pOwner
-  OCall [xax].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, xdx
+  OCall [xax].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
+
+  OCall xsi.CheckSndQueueLow                            ;May call Protocol.OnSendQueueLow
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComConnection.CheckSndQueueLow
+; Purpose:    Called after a send IOJob has left the send queue (completed or failed). When the
+;             queue has drained to dSndLowWtrMrk after it had reached dSndHighWtrMrk, the protocol
+;             is notified once (NetComProtocol.OnSendQueueLow), e.g. to resume a paused source.
+; Arguments:  None.
+; Return:     Nothing.
+; Note:       Called by the worker with the connection CritSect held.
+
+Method NetComConnection.CheckSndQueueLow, uses xsi
+  SetObject xsi
+  mov eax, [xsi].dSndQueuedIOJobs
+  .if eax <= [xsi].dSndLowWtrMrk
+    BitClr [xsi].dFlags, NCC_SND_PAUSED
+    .ifBitSet [xsi].dFlags, NCC_SND_QUEUE_HIGH
+      BitClr [xsi].dFlags, NCC_SND_QUEUE_HIGH
+      OCall [xsi].pProtocol::NetComProtocol.OnSendQueueLow, xsi
+    .endif
+  .endif
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------

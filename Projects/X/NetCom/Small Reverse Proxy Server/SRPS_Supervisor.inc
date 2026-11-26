@@ -12,6 +12,9 @@
 ;               - Accepted client connections are supervised (they were skipped like pending
 ;                 acceptors): timeout, backpressure server -> client. LastTime typo fixed; no
 ;                 inactivity timeout while the receive is paused.
+;               - Backpressure removed here: it is event driven now (ProcessData pauses the
+;                 source, OnSendQueueLow resumes it). Polling every 250 ms, skipped while the
+;                 pair was busy, let more than 100,000 sends pile up.
 ;             Version C.1.1, November 2026
 ;               - Backpressure uses NetComConnection.PauseReceive/ResumeReceive.
 ;             Version C.1.0, October 2017
@@ -115,27 +118,8 @@ Method NetComSrpsSupervisor.WorkerJob, uses xbx xdi xsi
           .endif
         .endif
 
-        ;Handle backpressure regulating the receive activity. Both connections of a pair share
-        ;one CritSect (NetComConnection.NewPartner), which is held here: the peer needs no lock.
-        mov xax, [xbx].$Obj(NetComConnection).pData
-        .if xax != NULL
-          mov xdi, [xax].SRPS_CONNECTION_DATA.pPeerConnection   ;xdi -> peer connection
-          .if xdi != NULL
-            mov eax, [xbx].$Obj(NetComConnection).dSndQueuedIOJobs
-            .ifBitClr [xdi].$Obj(NetComConnection).dFlags, NCC_RCV_PAUSED
-              .if eax >= [xbx].$Obj(NetComConnection).dSndHighWtrMrk
-                ;Stop receiving (TCP throttles the peer)
-                OCall xdi::NetComConnection.PauseReceive
-                DbgText "NCC_RCV_PAUSED"
-              .endif
-            .else
-              .if eax <= [xbx].$Obj(NetComConnection).dSndLowWtrMrk
-                ;Reenable receive IOJobs (posts a receive if none is outstanding)
-                OCall xdi::NetComConnection.ResumeReceive
-              .endif
-            .endif
-          .endif
-        .endif
+        ;Backpressure is event driven: NetComSrpsProtocol.ProcessData pauses the source when the
+        ;peer's send queue reaches its high-water mark, OnSendQueueLow resumes it.
         invoke LeaveCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
       .endif
 

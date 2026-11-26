@@ -56,6 +56,7 @@ Object NetComSrpsProtocol,, NetComProtocol
   RedefineMethod    OnConnected,        $ObjPtr(NetComConnection)
   RedefineMethod    OnDisconnected,     $ObjPtr(NetComConnection), DWORD, DWORD
   RedefineMethod    OnError,            $ObjPtr(NetComConnection), PIOJOB, DWORD
+  RedefineMethod    OnSendQueueLow,     $ObjPtr(NetComConnection)
   RedefineMethod    ProcessData,        $ObjPtr(NetComConnection), DWORD
   RedefineMethod    Release,            $ObjPtr(NetComConnection)
   VirtualMethod     ShowErrorBox,       PSTRING, DWORD
@@ -276,6 +277,26 @@ Method NetComSrpsProtocol.OnError, uses xbx xdi xsi, pConnection:$ObjPtr(NetComC
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
+; Method:     NetComSrpsProtocol.OnSendQueueLow
+; Purpose:    The send queue of a connection has drained to its low-water mark: resume the peer,
+;             whose receive was paused in ProcessData while this connection could not keep up.
+; Arguments:  Arg1: -> NetComConnection
+; Return:     Nothing.
+
+Method NetComSrpsProtocol.OnSendQueueLow,, pConnection:$ObjPtr(NetComConnection)
+  DbgSetWindowName
+
+  mov xcx, pConnection
+  mov xax, [xcx].$Obj(NetComConnection).pData
+  .if xax != NULL
+    mov xax, [xax].SRPS_CONNECTION_DATA.pPeerConnection
+    .if xax != NULL
+      OCall xax::NetComConnection.ResumeReceive         ;Shared CritSect (NewPartner) is held
+    .endif
+  .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
 ; Method:     NetComSrpsProtocol.ProcessData
 ; Purpose:    Forwards received data to the paired connection.
 ; Arguments:  Arg1: -> NetComConnection
@@ -346,6 +367,14 @@ Method NetComSrpsProtocol.ProcessData, uses xbx xdi xsi, pConnection:$ObjPtr(Net
     mov xax, [xdi].$Obj(NetComConnection).pOwner
     OCall [xax].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, xsi
   .endw
+
+  ;Backpressure: while the peer cannot send fast enough (its send queue reached the high-water
+  ;mark), stop receiving on this side. NetComSrpsProtocol.OnSendQueueLow of the peer resumes it.
+  ;Everything received so far was forwarded above, nothing waits in the receive chain.
+  mov eax, [xdi].$Obj(NetComConnection).dSndQueuedIOJobs
+  .if eax >= [xdi].$Obj(NetComConnection).dSndHighWtrMrk
+    OCall pConnection::NetComConnection.PauseReceive
+  .endif
 
   ;Since we processed the IOJobs here, return zero to avoid any further processing.
   xor eax, eax

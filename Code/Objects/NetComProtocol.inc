@@ -6,6 +6,7 @@
 ; Notes:      Version C.1.2, November 2026
 ;               - IsDataComplete?: which IOJobs of the receive chains hold valid data.
 ;               - OnError: NULL arguments documented.
+;               - OnSendQueueLow: new (send queue drained after reaching the high-water mark).
 ;             Version C.1.1, November 2026
 ;               - Allocate: failure contract documented (fail closed for TLS).
 ;             Version C.1.0, October 2017
@@ -227,6 +228,20 @@ Method NetComProtocol.OnError,, pConnection:$ObjPtr(NetComConnection), pIOJob:PI
   .else
     mov eax, PROT_CMD_DESTROY
   .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComProtocol.OnSendQueueLow
+; Purpose:    The send queue of a connection has drained to its low-water mark (dSndLowWtrMrk)
+;             after it had reached the high-water mark (dSndHighWtrMrk). Called once per cycle by
+;             a worker with the connection CritSect held. Typical use: resume a source that was
+;             paused while this connection could not send fast enough (proxy backpressure).
+; Arguments:  Arg1: -> NetComConnection.
+; Return:     Nothing.
+
+Method NetComProtocol.OnSendQueueLow,, pConnection:$ObjPtr(NetComConnection)
+  ANNOTATION use:pConnection
+  DbgSetWindowName
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------

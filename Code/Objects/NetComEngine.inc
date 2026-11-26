@@ -22,6 +22,8 @@
 ;                 CreateConnection (new, NewConnection uses it) can create a connection sharing the
 ;                 CritSect of another one; LeaveConnection also destroys a lock owner that only
 ;                 waited for the destroyed partner (no supervisor).
+;               - WorkerJob: a failed send/receive completion decrements dSndQueuedIOJobs /
+;                 dRcvQueuedIOJobs (they stayed high), the send queue check follows.
 ;             Version C.1.1, November 2026
 ;               - NewAcceptor: checks the NetComConnection.Init result; on failure the connection
 ;                 is returned to the pool instead of queuing AcceptEx on an invalid socket.
@@ -717,7 +719,7 @@ MethodEnd
 
 Method NetComEngine.WorkerJob, uses xbx xdi xsi
   local pIOJob:PIOJOB, xCompletionKey:XWORD, dBytesTransfered:DWORD
-  local dFlags:DWORD, dBytesConsumed:DWORD, dOvrResult:DWORD
+  local dFlags:DWORD, dBytesConsumed:DWORD, dOvrResult:DWORD, dError:DWORD
   local pEngine:POINTER
 
   SetObject xsi
@@ -850,7 +852,18 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
         .else
           ;Operation failed! *******************************************************************
           invoke WSAGetLastError                        ;This error is thread specific
-          OCall xdi::NetComConnection.OnError, xbx, eax
+          mov dError, eax
+          ;A failed send or receive leaves its queue like a completed one. Without this, the send
+          ;queue never drains after cancelled sends (a paused source would stay paused) and no
+          ;new receive can be queued after a failed one.
+          movzx eax, [xbx].IOJOB.wOperation
+          .if eax == IOJOB_SEND
+            dec [xdi].$Obj(NetComConnection).dSndQueuedIOJobs
+            OCall xdi::NetComConnection.CheckSndQueueLow
+          .elseif eax == IOJOB_RECV
+            lock dec [xdi].$Obj(NetComConnection).dRcvQueuedIOJobs
+          .endif
+          OCall xdi::NetComConnection.OnError, xbx, dError
         .endif
 
       .endif
