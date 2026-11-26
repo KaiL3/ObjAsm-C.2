@@ -962,7 +962,8 @@ TestConnectionsAction proc uses xbx xdi xsi, pEngine:POINTER, dAction:DWORD
       .continue .if [xcx].$Obj(NetComConnection).pTLSContext != NULL
     .endif
 
-    invoke TryEnterCriticalSection, addr [xcx].$Obj(NetComConnection).CritSect
+    .continue .if [xcx].$Obj(NetComConnection).pCritSect == NULL    ;Init not done yet
+    invoke TryEnterCriticalSection, [xcx].$Obj(NetComConnection).pCritSect
     .continue .if eax == FALSE
 
     .if dAction == TTA_PAUSE
@@ -980,7 +981,7 @@ TestConnectionsAction proc uses xbx xdi xsi, pEngine:POINTER, dAction:DWORD
     inc dCount
 
     mov xcx, pConn
-    invoke LeaveCriticalSection, addr [xcx].$Obj(NetComConnection).CritSect
+    invoke LeaveCriticalSection, [xcx].$Obj(NetComConnection).pCritSect
   .endw
   invoke LeaveCriticalSection, addr [xsi].$Obj(NetComEngine).ConnectionPool.CritSect
   mov eax, dCount

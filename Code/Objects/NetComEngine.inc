@@ -18,6 +18,10 @@
 ;               - WorkerJob: no stale completion key if GetQueuedCompletionStatus dequeues no
 ;                 packet; OnClosed is not delivered before OnDisconnected.
 ;               - StartListening: returns the error if not a single acceptor could be queued.
+;               - Connection CritSects are used through NetComConnection.pCritSect;
+;                 CreateConnection (new, NewConnection uses it) can create a connection sharing the
+;                 CritSect of another one; LeaveConnection also destroys a lock owner that only
+;                 waited for the destroyed partner (no supervisor).
 ;             Version C.1.1, November 2026
 ;               - NewAcceptor: checks the NetComConnection.Init result; on failure the connection
 ;                 is returned to the pool instead of queuing AcceptEx on an invalid socket.
@@ -146,7 +150,11 @@ Method NetComEngine.ConnectionsApply, uses xbx xdi xsi, dAction:DWORD
       lea xax, [xbx - offset($Obj(NetComConnection).ChainItem)]
       mov pConnection, xax
       mov xbx, [xbx].SDLL_ITEM.pNextItem                ;Move to next item
-      invoke TryEnterCriticalSection, addr [xax].$Obj(NetComConnection).CritSect
+      .if [xax].$Obj(NetComConnection).pCritSect == NULL
+        inc dBusy                                       ;Init not done yet => next pass
+        .continue
+      .endif
+      invoke TryEnterCriticalSection, [xax].$Obj(NetComConnection).pCritSect
       .if eax == FALSE
         inc dBusy                                       ;Busy => next pass
       .else
@@ -162,7 +170,7 @@ Method NetComEngine.ConnectionsApply, uses xbx xdi xsi, dAction:DWORD
           OCall pConnection::NetComConnection.Close, FALSE
         .endif
         mov xcx, pConnection
-        invoke LeaveCriticalSection, addr [xcx].$Obj(NetComConnection).CritSect
+        invoke LeaveCriticalSection, [xcx].$Obj(NetComConnection).pCritSect
       .endif
     .endw
     invoke LeaveCriticalSection, addr [xsi].ConnectionPool.CritSect
@@ -238,7 +246,9 @@ MethodEnd
 ; Method:     NetComEngine.DiscardConnection
 ; Purpose:    Releases a connection that has no IO in flight (e.g. QueueConnect failed) and returns
 ;             it to the pool.
-; Arguments:  Arg1: -> NetComConnection. Its CritSect must not be held by the caller.
+; Arguments:  Arg1: -> NetComConnection. Its own CritSect must not be held by the caller (Done
+;                   deletes it). A partner (NetComConnection.NewPartner) is discarded with the
+;                   shared CritSect held, since FreeRessources releases the lock owner.
 ; Return:     Nothing.
 ; Note:       NetComConnection.Close posts OnDisconnected/OnClosed completions to the IOCP. They
 ;             would be processed after the connection was returned to the pool (use after free or
@@ -429,20 +439,38 @@ MethodEnd
 ; Note:       Also called after the synthetic OnDisconnected/OnClosed completions: they are usually
 ;             the last events of a connection and their delivery is required for destruction.
 
-Method NetComEngine.LeaveConnection, uses xbx xsi, pConnection:$ObjPtr(NetComConnection)
+Method NetComEngine.LeaveConnection, uses xbx xdi xsi, pConnection:$ObjPtr(NetComConnection)
+  local pLockOwner:$ObjPtr(NetComConnection), pOwnerDone:$ObjPtr(NetComConnection)
+
   SetObject xsi
   mov xbx, pConnection
+  mov xdi, [xbx].$Obj(NetComConnection).pCritSect       ;CritSect held by the caller
   .if [xsi].pSupervisor == NULL
     OCall xbx::NetComConnection.ReadyToDestroy?         ;Closes it first if necessary
     .if eax != FALSE
-      OCall xbx::NetComConnection.FreeRessources        ;Protocol data and IOJobs
-      invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-      OCall xbx::NetComConnection.Done
+      m2m pLockOwner, [xbx].$Obj(NetComConnection).pLockOwner, xax
+      mov pOwnerDone, NULL
+      OCall xbx::NetComConnection.FreeRessources        ;Protocol data, IOJobs, lock owner use
+      ;A lock owner that only waited for this partner gets no further completion: destroy it
+      ;here as well, while the shared CritSect is still held
+      .if pLockOwner != NULL
+        OCall pLockOwner::NetComConnection.ReadyToDestroy?
+        .if eax != FALSE
+          OCall pLockOwner::NetComConnection.FreeRessources
+          m2m pOwnerDone, pLockOwner, xax
+        .endif
+      .endif
+      invoke LeaveCriticalSection, xdi
+      OCall xbx::NetComConnection.Done                  ;Own CritSect of the partner
       OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
+      .if pOwnerDone != NULL
+        OCall pOwnerDone::NetComConnection.Done         ;Deletes the shared CritSect
+        OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, pOwnerDone
+      .endif
       ExitMethod
     .endif
   .endif
-  invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+  invoke LeaveCriticalSection, xdi
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -477,6 +505,39 @@ Method NetComEngine.NewAcceptor, uses xbx xsi, pListener:PLISTENER, pProtocol:$O
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
+; Method:     NetComEngine.CreateConnection
+; Purpose:    Creates a NetComConnection and registers its socket with the IOCP.
+; Arguments:  Arg1: -> protocol object.
+;             Arg2: -> NetComConnection whose CritSect the new connection uses, or NULL for its own
+;                   CritSect. The caller must hold that CritSect (see NetComConnection.NewPartner).
+; Return:     xax -> New NetComConnection or NULL if failed.
+
+Method NetComEngine.CreateConnection, uses xbx xsi, pProtocol:POINTER, pLockOwner:POINTER
+  SetObject xsi
+  OCall [xsi].ConnectionPool::NetComConnectionPool.NewItem
+  .if xax != NULL
+    mov xbx, xax
+    m2m [xbx].$Obj(NetComConnection).pLockOwner, pLockOwner, xax   ;Evaluated by Init
+    OCall xbx::NetComConnection.Init, addr [xsi].ConnectionPool, pProtocol
+    .if eax == 0                                        ;Zero means success
+      ;Register the socket with IOCP, because we want socket event notifications
+      invoke CreateIoCompletionPort, [xbx].$Obj(NetComConnection).hSocket, [xsi].hIOCP, xbx, 0
+      mov xax, pLockOwner
+      .if xax != NULL
+        inc [xax].$Obj(NetComConnection).dLockUsers     ;Shared CritSect held by the caller
+      .endif
+      mov xax, xbx
+    .else
+      ;Failed to initialize new connection (the owner was not counted yet)
+      mov [xbx].$Obj(NetComConnection).pLockOwner, NULL
+      OCall xbx::NetComConnection.Done                  ;Delete the own CritSect
+      OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
+      xor eax, eax
+    .endif
+  .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
 ; Method:     NetComEngine.NewConnection
 ; Purpose:    Creates a NetComConnection.
 ; Arguments:  Arg1: -> protocol object.
@@ -484,23 +545,9 @@ MethodEnd
 ; Notes:      This method is useful for creating sockets with arbitrary semantics.
 ;             Use this for 'connectionless' socket types.
 
-Method NetComEngine.NewConnection, uses xbx xsi, pProtocol:$ObjPtr(NetComProtocol)
+Method NetComEngine.NewConnection, uses xsi, pProtocol:$ObjPtr(NetComProtocol)
   SetObject xsi
-  OCall [xsi].ConnectionPool::NetComConnectionPool.NewItem
-  .if xax != NULL
-    mov xbx, xax
-    OCall xbx::NetComConnection.Init, addr [xsi].ConnectionPool, pProtocol
-    .if eax == 0                                        ;Zero means success
-      ;Register the socket with IOCP, because we want socket event notifications
-      invoke CreateIoCompletionPort, [xbx].$Obj(NetComConnection).hSocket, [xsi].hIOCP, xbx, 0
-      mov xax, xbx
-    .else
-      ;Failed to initialize new connection
-      OCall xbx::NetComConnection.Done                  ;Delete the CritSect
-      OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
-      xor eax, eax
-    .endif
-  .endif
+  OCall xsi.CreateConnection, pProtocol, NULL
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -700,7 +747,7 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
     ; ??????????????????????????????????????????????????????????????????????????
     .if xCompletionKey == COMPLETION_KEY_DISCONNECTED
       mov xdi, pIOJob                                    ;xdi -> NetComConnection
-      invoke TryEnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      invoke TryEnterCriticalSection, [xdi].$Obj(NetComConnection).pCritSect
       .if eax != FALSE
         OCall [xdi].$Obj(NetComConnection).pProtocol::NetComProtocol.OnDisconnected, \
               xdi, [xdi].$Obj(NetComConnection).dDisconnectDirection, \
@@ -720,14 +767,14 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
 
     .elseif xCompletionKey == COMPLETION_KEY_CLOSED
       mov xdi, pIOJob                                    ;xdi -> NetComConnection
-      invoke TryEnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      invoke TryEnterCriticalSection, [xdi].$Obj(NetComConnection).pCritSect
       .if eax != FALSE
         ;Keep the order OnDisconnected -> OnClosed: a re-posted DISCONNECTED completion can
         ;arrive after this one
         mov eax, [xdi].$Obj(NetComConnection).dFlags
         and eax, NCC_DISCONNECT_POSTED or NCC_DISCONNECTED_DELIVERED
         .if eax == NCC_DISCONNECT_POSTED
-          invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+          invoke LeaveCriticalSection, [xdi].$Obj(NetComConnection).pCritSect
           invoke PostQueuedCompletionStatus, [xsi].hIOCP, 0, COMPLETION_KEY_CLOSED, xdi
           .continue
         .endif
@@ -751,7 +798,7 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
       .if xCompletionKey == COMPLETION_KEY_VOID
         mov xdi, xbx                                    ;pConnection passed using pIOJob
         DbgHex xdi, "NetComEngine.WorkerJob - VOID posted"
-        invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+        invoke EnterCriticalSection, [xdi].$Obj(NetComConnection).pCritSect
 
       .else
         .if xCompletionKey == COMPLETION_KEY_SOCK_ACCEPTED
@@ -761,7 +808,7 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
           mov xdi, xCompletionKey                       ;xdi -> NetComConnection
         .endif
 
-        invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+        invoke EnterCriticalSection, [xdi].$Obj(NetComConnection).pCritSect
         
         invoke GetSystemTimeAsFileTime, addr [xdi].$Obj(NetComConnection).LastTime
 

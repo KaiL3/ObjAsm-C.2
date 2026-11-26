@@ -7,6 +7,7 @@
 ;               - Destruction is decided by NetComConnection.ReadyToDestroy? under the connection
 ;                 CritSect (re-check after TryEnter; a connection not closed yet is closed first).
 ;               - Protocol callbacks (handshake/pause timeout) run without the pool lock.
+;               - Connection CritSects through pCritSect; connections before Init are skipped.
 ;             Version C.1.1, November 2026
 ;               - Accepted (server) connections are supervised, only pending acceptors are skipped.
 ;               - TLS handshake timeout (dHandshakeTimeout) for the initial handshake.
@@ -119,6 +120,11 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
 
       lea xbx, [xbx - offset $Obj(NetComConnection).ChainItem]  ;xbx -> NetComConnection
 
+      ;NetComConnectionPool.NewItem links a connection before its Init has set pCritSect
+      .if [xbx].$Obj(NetComConnection).pCritSect == NULL
+        jmp @@Next
+      .endif
+
       ;Skip only pending acceptors (AcceptEx posted, no peer connected yet). Accepted server
       ;connections must be supervised like client connections (timeouts).
       mov eax, [xbx].$Obj(NetComConnection).dFlags
@@ -127,7 +133,7 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
 
         ;A busy connection is checked in the next cycle. Restarting the whole traversal here
         ;can starve the supervisor (and the destruction below) under load.
-        invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+        invoke TryEnterCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
         .if eax == FALSE
           jmp @@Next
         .endif
@@ -262,7 +268,7 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
           .endif
         .endif
 
-        invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+        invoke LeaveCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
       .endif
 
 
@@ -271,17 +277,17 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
       ;The unlocked tests are a cheap pre-filter, ReadyToDestroy? decides under the CritSect.
       .ifBitSet [xbx].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY
         .if [xbx].$Obj(NetComConnection).dPendingIOJobs == 0
-          invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+          invoke TryEnterCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
           .if eax == FALSE
             jmp @@Next                                  ;Busy => destroy it in the next cycle
           .endif
           OCall xbx::NetComConnection.ReadyToDestroy?   ;Closes it first if necessary
           .if eax == FALSE
-            invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+            invoke LeaveCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
             jmp @@Next
           .endif
           OCall xbx::NetComConnection.FreeRessources    ;Protocol data and IOJobs
-          invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+          invoke LeaveCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
           OCall xbx::NetComConnection.Done
           mov xcx, [xsi].pOwner
           mov xdx, xbx

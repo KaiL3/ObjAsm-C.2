@@ -59,6 +59,9 @@
 ;                 stopped); NetComConnection.OnAccepted re-arms only open listeners.
 ;               - NetComConnection: TLS error paths abort the connection; NetComEngine:
 ;                 StartListening reports a failure to queue any acceptor.
+;               - NetComConnection: the CritSect is used through pCritSect; NewPartner creates a
+;                 connection that shares the CritSect of another one (e.g. both sides of a proxy
+;                 pair: one thread at a time per pair, no lock cycles between them).
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -452,6 +455,7 @@ Object NetComConnection, NetComConnectionID, Primer
 
   VirtualMethod   QueueDestroy
   StaticMethod    ReadyToDestroy?                       ;Destruction check (CritSect held)
+  StaticMethod    NewPartner,         POINTER           ;-> Protocol; shares this CritSect
 
   ;Methods to place IO socket jobs or messages on the IOCP queue
   VirtualMethod   QueueAccept,        PLISTENER               ;-> Listener
@@ -512,7 +516,10 @@ Object NetComConnection, NetComConnectionID, Primer
   DefineVariable  pData,              POINTER,          NULL  ;-> Data managed by the protocol
   DefineVariable  dDisconnectError,   DWORD,            0     ;Error-Code fr async OnDisconnected
   DefineVariable  dDisconnectDirection, DWORD,          0     ;Direction fr async OnDisconnected (SD_xxx)
-  DefineVariable  CritSect,           CRITICAL_SECTION, {}
+  DefineVariable  CritSect,           CRITICAL_SECTION, {}  ;Own CritSect (Init/Done only)
+  DefineVariable  pCritSect,          POINTER,          NULL  ;-> CritSect in use: own or lock owner's
+  DefineVariable  pLockOwner,         POINTER,          NULL  ;Partner: connection owning the CritSect
+  DefineVariable  dLockUsers,         DWORD,            0     ;Partners using the own CritSect
   DefineVariable  wName,              CHRW,             28 dup(?) ;Used for DebugCenter Wnd Caption
 ObjectEnd
 
@@ -607,6 +614,7 @@ Object NetComEngine, NetComEngineID, Primer
   VirtualMethod   ConnectionsDisconnect
   VirtualMethod   ConnectionsDestroy
   StaticMethod    ConnectionsApply,   DWORD                   ;NCE_APPLY_xxx
+  StaticMethod    CreateConnection,   POINTER, POINTER        ;-> Protocol, -> lock owner or NULL
   VirtualMethod   ConnectTo,          $ObjPtr(NetComProtocol), PNETCOMADDR, PNETCOMADDR
   StaticMethod    DiscardConnection,  $ObjPtr(NetComConnection)
   RedefineMethod  Done

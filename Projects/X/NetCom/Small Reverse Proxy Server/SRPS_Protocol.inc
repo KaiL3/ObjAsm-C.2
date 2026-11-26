@@ -121,58 +121,41 @@ MethodEnd
 ; Return:     Nothing.
 
 Method NetComSrpsProtocol.OnAccepted, uses xbx xdi xsi, pConnection:$ObjPtr(NetComConnection)
-  local dResult:DWORD
   DbgSetWindowName
 
   SetObject xsi
-@@Retry:
-  mov dResult, FALSE
-  mov xbx, pConnection
+  mov xbx, pConnection                                  ;xbx -> client connection (CritSect held)
   .if [xbx].$Obj(NetComConnection).pData == NULL
     ExitMethod
   .endif
 
-  ;Get a new NetComConnection and (re)initialize it.
-  mov xdi, [xsi].pOwner                                 ;xdi -> Application
-  OCall [xdi].$Obj(Application).RevProxy::NetComEngine.NewConnection, xsi
+  ;Create the server connection as partner: it shares the CritSect of the client connection, so
+  ;one thread at a time works on the pair and forwarding in both directions cannot deadlock
+  OCall xbx::NetComConnection.NewPartner, xsi
   .if xax == NULL
-    ExitMethod
-  .endif
-
-  mov xdi, xax
-  invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-  OCall xdi::NetComConnection.QueueConnect, addr [xsi].ServerRemoteAddr, addr [xsi].ServerLocalAddr
-  .if eax != NO_ERROR
-    ;If we have an error here, nothing was queued, so we can dispose our connection safely.
-    ;DiscardConnection does not post OnDisconnected/OnClosed (FreeRessources would).
-    invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-    mov xax, [xsi].pOwner                               ;xax -> Application
-    OCall [xax].$Obj(Application).RevProxy::NetComEngine.DiscardConnection, xdi
-
-    ;Acceptor teardown
-    OCall xbx::NetComConnection.Disconnect, SD_SEND
-    OCall xbx::NetComConnection.QueueDestroy
+    OCall xbx::NetComConnection.QueueDestroy            ;Not admitted, nothing queued
     OCall xbx::NetComConnection.Close, TRUE
     ExitMethod
   .endif
+  mov xdi, xax                                          ;xdi -> server connection
 
-  ;Connect was successfuly queued
-  ;Link connections, xbx = Client connection, xdi, server connection
-  mov xdx, [xbx].$Obj(NetComConnection).pData       ;This is != NULL
-  mov [xdx].SRPS_CONNECTION_DATA.pPeerConnection, xdi
-  mov xdx, [xdi].$Obj(NetComConnection).pData
-  .if xdx != NULL
-    mov [xdx].SRPS_CONNECTION_DATA.pPeerConnection, xbx
-    mov dResult, TRUE
+  ;Link both sides before the connect can complete (pData != NULL, Allocate succeeded)
+  mov xax, [xbx].$Obj(NetComConnection).pData
+  mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, xdi
+  mov xax, [xdi].$Obj(NetComConnection).pData
+  mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, xbx
+
+  OCall xdi::NetComConnection.QueueConnect, addr [xsi].ServerRemoteAddr, addr [xsi].ServerLocalAddr
+  .if eax != NO_ERROR
+    ;Nothing was queued: unlink and discard the server connection (DiscardConnection posts no
+    ;OnDisconnected/OnClosed; the shared CritSect is held as required), then drop the client
+    mov xax, [xbx].$Obj(NetComConnection).pData
+    mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
+    mov xax, [xsi].pOwner                               ;xax -> Application
+    OCall [xax].$Obj(Application).RevProxy::NetComEngine.DiscardConnection, xdi
+    OCall xbx::NetComConnection.QueueDestroy
+    OCall xbx::NetComConnection.Close, TRUE
   .endif
-
-  .if dResult == FALSE
-    OCall xdi::NetComConnection.Disconnect, SD_SEND
-    OCall xdi::NetComConnection.QueueDestroy
-    OCall xdi::NetComConnection.Close, TRUE
-  .endif
-  invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -186,32 +169,22 @@ Method NetComSrpsProtocol.OnConnected, uses xbx xdi, pConnection:$ObjPtr(NetComC
 
 ;  DbgText "NetComSrpsProtocol.OnConnected", pDbgWndNameW
 
-  mov xdi, pConnection
+  ;Both connections of the pair share one CritSect (NewPartner), held by this worker
+  mov xdi, pConnection                                  ;xdi -> server connection
   mov xax, [xdi].$Obj(NetComConnection).pData
   .if xax != NULL
-    mov xbx, [xax].SRPS_CONNECTION_DATA.pPeerConnection   ;xbx -> peer connection
+    mov xbx, [xax].SRPS_CONNECTION_DATA.pPeerConnection ;xbx -> client connection
     .if xbx != NULL
-      .while TRUE
-        invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-        .break .if eax != FALSE
-        invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-        invoke Sleep, 10
-        invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-      .endw      
-      .ifBitClr [xbx].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY
-        OCall xbx::NetComConnection.Admit, TRUE
+      .ifBitClr [xbx].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY or NCC_CLOSED
+        OCall xbx::NetComConnection.Admit, TRUE         ;Start receiving from the client
         OCall xdi::NetComConnection.QueueReceive
-      .else
-        OCall xbx::NetComConnection.Admit, FALSE
-        OCall xdi::NetComConnection.Disconnect, SD_SEND
-        OCall xdi::NetComConnection.QueueDestroy
-        OCall xdi::NetComConnection.Close, TRUE
+        ExitMethod
       .endif
-      invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-      ExitMethod
+      OCall xbx::NetComConnection.Admit, FALSE
     .endif
   .endif
 
+  ;No (usable) client connection
   OCall xdi::NetComConnection.Disconnect, SD_SEND
   OCall xdi::NetComConnection.QueueDestroy
   OCall xdi::NetComConnection.Close, TRUE
@@ -226,8 +199,8 @@ MethodEnd
 ;             Arg3: Operation result.
 ; Return:     Nothing.
 
-Method NetComSrpsProtocol.OnDisconnected, uses xbx xdi xsi, pConnection:$ObjPtr(NetComConnection), \
-                                                            dDirection:DWORD, dResult:DWORD
+Method NetComSrpsProtocol.OnDisconnected, uses xbx xdi, pConnection:$ObjPtr(NetComConnection), \
+                                                        dDirection:DWORD, dResult:DWORD
   DbgSetWindowName
 
 ;  DbgText "NetComSrpsProtocol.OnDisconnected", pDbgWndNameW
@@ -235,27 +208,15 @@ Method NetComSrpsProtocol.OnDisconnected, uses xbx xdi xsi, pConnection:$ObjPtr(
   mov xax, [xdi].$Obj(NetComConnection).pData
   .if xax != NULL
     mov xbx, [xax].SRPS_CONNECTION_DATA.pPeerConnection   ;xbx -> peer connection
-    mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
     .if xbx != NULL
-      ;Break links on both connections to avoid recursion
-      .while TRUE
-        invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-        invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-        .break .if eax != FALSE
-        invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-        invoke Sleep, 10
-      .endw
-      mov xsi, [xbx].$Obj(NetComConnection).pData
-      .if xsi != NULL
-        mov [xsi].SRPS_CONNECTION_DATA.pPeerConnection, NULL
+      ;Both share one CritSect (NewPartner), held by this worker: break the links on both sides
+      ;and let the peer disconnect gracefully; its own OnDisconnected completes its teardown.
+      mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
+      mov xcx, [xbx].$Obj(NetComConnection).pData
+      .if xcx != NULL
+        mov [xcx].SRPS_CONNECTION_DATA.pPeerConnection, NULL
       .endif
-      ;Peer connection teardown
-      ;Calling Disconnect(SD_SEND) will trigger a sequence of actions:
-      ;  First it calls disconnect and then triggers OnDisconnected for the peer connection again,
-      ;  what starts its seldfestruction.
-      OCall xbx::NetComConnection.Disconnect, SD_SEND   ;Initiate a graceful disconnect
-      invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-      invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      OCall xbx::NetComConnection.Disconnect, SD_SEND
     .endif
   .endif
 
@@ -286,103 +247,14 @@ Method NetComSrpsProtocol.OnError, uses xbx xdi xsi, pConnection:$ObjPtr(NetComC
   SetObject xsi
 ;  DbgDec dError, "NetComSrpsProtocol.OnError", pDbgWndNameW
 
-  mov xcx, pIOJob
+  .if pIOJob != NULL
+    ;An IO operation failed (accept, connect, send or receive): destroy this connection. Close
+    ;posts OnDisconnected, which breaks the pair and disconnects the peer. Both connections
+    ;share one CritSect (NewPartner), so nothing has to wait for the peer here.
+    mov eax, PROT_CMD_DESTROY
 
-  .if xcx != NULL
-    movzx eax, [xcx].IOJOB.wOperation
-    mov xdi, pConnection                                ;xdi -> connection
-    .if eax == IOJOB_ACCEPT
-;      DbgText "NetComSrpsProtocol.OnError - Accept", pDbgWndNameW
-      mov eax, PROT_CMD_DESTROY
-
-    .elseif eax == IOJOB_CONNECT
-;      DbgText "NetComSrpsProtocol.OnError - Connect", pDbgWndNameW
-      mov xax, [xdi].$Obj(NetComConnection).pData
-      .if xax != NULL
-        mov xbx, [xax].SRPS_CONNECTION_DATA.pPeerConnection ;xbx -> peer connection
-        .if xbx != NULL
-;          DbgText "NetComSrpsProtocol.OnError - Connect: destroy peer", pDbgWndNameW
-;          DbgDec dError, "NetComSrpsProtocol.OnError", pDbgWndNameW
-          ;Break links on both connections to avoid recursion
-          mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
-          .while TRUE
-            invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-            .break .if eax != FALSE
-            invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-            invoke Sleep, 10
-            invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-          .endw
-          mov xax, [xbx].$Obj(NetComConnection).pData
-          .if xax != NULL
-            mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
-            OCall xbx::NetComConnection.Admit, TRUE     ;Admit it to allow a graceful disconnection
-            OCall xbx::NetComConnection.Disconnect, SD_SEND
-          .endif
-          invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-        .endif
-      .endif
-      mov eax, PROT_CMD_DESTROY                         ;Destroy itself
-
-    .elseif eax == IOJOB_SEND
-;      DbgText "NetComSrpsProtocol.OnError - Send", pDbgWndNameW
-      mov xax, [xdi].$Obj(NetComConnection).pData
-      .if xax != NULL
-        mov xbx, [xax].SRPS_CONNECTION_DATA.pPeerConnection   ;xbx -> peer connection
-        .if xbx != NULL
-          ;Break links on both connections to avoid recursion
-          mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
-          .while TRUE
-            invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-            .break .if eax != FALSE
-            invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-            invoke Sleep, 10
-            invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-          .endw
-          mov xax, [xbx].$Obj(NetComConnection).pData
-          .if xax != NULL
-            mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
-          .endif
-          invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-          OCall xbx::NetComConnection.QueueDestroy      ;Peer connection teardown
-          OCall xbx::NetComConnection.Close, TRUE
-        .endif
-      .endif
-      mov eax, PROT_CMD_DESTROY                         ;Destroy itself
-
-    .elseif eax == IOJOB_RECV
-;      DbgText "NetComSrpsProtocol.OnError - Receive", pDbgWndNameW
-      mov xax, [xdi].$Obj(NetComConnection).pData
-      .if xax != NULL
-        mov xbx, [xax].SRPS_CONNECTION_DATA.pPeerConnection   ;xbx -> peer connection
-        .if xbx != NULL
-          ;Break links on both connections to avoid recursion
-          mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
-          .while TRUE
-            invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-            .break .if eax != FALSE
-            invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-            invoke Sleep, 10
-            invoke EnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-          .endw
-          mov xax, [xbx].$Obj(NetComConnection).pData
-          .if xax != NULL
-            mov [xax].SRPS_CONNECTION_DATA.pPeerConnection, NULL
-          .endif
-          invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
-          OCall xbx::NetComConnection.QueueDestroy      ;Peer connection
-          OCall xbx::NetComConnection.Close, TRUE
-        .endif
-      .endif
-      mov eax, PROT_CMD_DESTROY                         ;Destroy itself
-
-    .else
-      DbgWarning "NetComSrpsProtocol.OnError - Unknown operation", pDbgWndNameW
-      DbgDec [xdx].IOJOB.wOperation,, pDbgWndNameW
-      mov eax, PROT_CMD_NONE
-    .endif
-
-  .else
-    ;Catch some well known errors
+  .elseif pConnection == NULL
+    ;Listener errors (NetComEngine.StartListening, called by the application thread)
     mov eax, dError
     .if eax == WSAEADDRINUSE
       lea xbx, cBuffer
@@ -394,6 +266,12 @@ Method NetComSrpsProtocol.OnError, uses xbx xdi xsi, pConnection:$ObjPtr(NetComC
       WriteF xbx, "Unhandled error"
       OCall xsi.ShowErrorBox, addr cBuffer, dError
     .endif
+    mov eax, PROT_CMD_NONE
+
+  .else
+    ;Errors without IO operation (receive limit, timeouts): the connection handles them itself.
+    ;No MessageBox: this runs on a worker or the supervisor thread.
+    mov eax, PROT_CMD_NONE
   .endif
 MethodEnd
 
@@ -442,6 +320,8 @@ Method NetComSrpsProtocol.ProcessData, uses xbx xdi xsi, pConnection:$ObjPtr(Net
     test [xsi].IOJOB.wFlags, IOF_JOB_COMPLETED
     .break .if ZERO?                                    ;IOJob receive pending?
 
+    ;The peer shares the CritSect of this connection (NewPartner): QueueSend enters it
+    ;recursively and never waits for another thread
     OCall xdi::NetComConnection.QueueSend, addr [xsi].IOJOB.DataBuffer, [xsi].IOJOB.dBytesConsumed
     ;The retured value is the number of queued bytes, that may be different than TransmitionLength
     .break .if eax == 0                                 ;Transmission paused

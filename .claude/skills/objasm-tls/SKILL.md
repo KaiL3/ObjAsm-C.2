@@ -36,9 +36,14 @@ TLS_DefaultCertValidator`. Library order is in `Code/Objects/Build/ObjectsX.lst`
 ## Invariants - do not break these
 
 1. **One thread per connection at a time.** `NetComEngine.WorkerJob` enters the connection
-   `CritSect` before every completion, and only one WSARecv is outstanding (the next one is posted
-   inside the critical section). Application-thread entry points (`QueueSend`, `Disconnect`) enter
-   the same recursive CritSect. Every new TLS entry point must do the same.
+   lock before every completion, and only one WSARecv is outstanding (the next one is posted
+   inside the critical section). Application-thread entry points (`QueueSend`, `Disconnect`,
+   `Close`, `QueueDestroy`) enter the same recursive lock. Every new TLS entry point must do the
+   same. The lock is always used through **`[xsi].pCritSect`** (never `addr [xsi].CritSect`,
+   which only `Init`/`Done` touch): a partner created with `NetComConnection.NewPartner` shares the
+   CritSect of its lock owner, so a connection pair (e.g. SRPS client/server side) is processed by
+   one thread at a time and code working on both sides cannot form lock cycles. The lock owner is
+   destroyed only after its partners (`dLockUsers`).
 2. **Receive order comes from `RcvIOJobChain`**, not from completion order. `OnReceivedTLS` drains
    only consecutive IOJobs flagged `IOF_JOB_COMPLETED` into the reassembly buffer.
 3. **Reassembly buffer ownership.** `pReassemblyBuffer/dReassemblyUsed` belong to the context but are

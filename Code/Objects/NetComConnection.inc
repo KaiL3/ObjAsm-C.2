@@ -15,6 +15,10 @@
 ;               - ReadyToDestroy?: destruction check under the CritSect, closes the connection
 ;                 first if necessary (FreeRessources must not post completions).
 ;               - OnAccepted: no new acceptor on a closed listener.
+;               - All locking goes through pCritSect (own CritSect, or the lock owner's for a
+;                 partner created with NewPartner). Init sets it once, it never changes. Done still
+;                 deletes the own CritSect; FreeRessources of a partner releases the lock owner
+;                 (dLockUsers), ReadyToDestroy? of an owner waits until no partner uses it.
 ;               - TLS error paths (handshake start in OnConnected, decrypt error, IO errors after
 ;                 the local TLS shutdown) abort the connection instead of leaving it alive until
 ;                 a supervisor timeout (forever without supervisor).
@@ -120,7 +124,7 @@ Method NetComConnection.CheckRcvLimit, uses xbx xdi xsi
     mov edx, [xcx].$Obj(NetComProtocol).dMaxRcvBuffered
     .if edx != 0
       mov dLimit, edx
-      invoke EnterCriticalSection, addr [xsi].CritSect
+      invoke EnterCriticalSection, [xsi].pCritSect
       .ifBitClr [xsi].dFlags, NCC_CLOSED or NCC_QUEUE_DESTROY
         xor edx, edx                                    ;edx = unconsumed BYTEs
 
@@ -154,7 +158,7 @@ Method NetComConnection.CheckRcvLimit, uses xbx xdi xsi
           OCall xsi.Close, TRUE                         ;Abortive close, drops all buffered data
         .endif
       .endif
-      invoke LeaveCriticalSection, addr [xsi].CritSect
+      invoke LeaveCriticalSection, [xsi].pCritSect
     .endif
   .endif
   mov eax, dResult
@@ -172,7 +176,7 @@ Method NetComConnection.Close, uses xsi, dAbortive:DWORD
   local Linger:linger
 
   SetObject xsi
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
   .ifBitClr [xsi].dFlags, NCC_CLOSED
 ;    DbgText "NetComConnection.Close", addr [xsi].wName
 
@@ -207,7 +211,7 @@ Method NetComConnection.Close, uses xsi, dAbortive:DWORD
     invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
            0, COMPLETION_KEY_CLOSED, xsi
   .endif
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -223,7 +227,7 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
   SetObject xsi
 ;  DbgText "NetComConnection.Disconnect", addr [xsi].wName
   mov dRetValue, NO_ERROR
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
   .ifBitClr [xsi].dFlags, NCC_CLOSED
 
     ;A paused receive would block the graceful close: the peer's FIN or close_notify response
@@ -273,7 +277,7 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
     .endif
   .endif
 @@Exit:
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
   mov eax, dRetValue
 MethodEnd
 
@@ -286,7 +290,10 @@ MethodEnd
 Method NetComConnection.Done, uses xsi
   SetObject xsi
 ;  DbgText "NetComConnection.Done ***********************************************", addr [xsi].wName
+  ;Always the own CritSect. A partner never used it; the shared one is deleted with its owner,
+  ;which is destroyed only after all partners (dLockUsers).
   invoke DeleteCriticalSection, addr [xsi].CritSect
+  mov [xsi].pCritSect, NULL
   BitSet [xsi].dFlags, NCC_DONE
   ACall xsi.Done
 MethodEnd
@@ -342,7 +349,7 @@ Method NetComConnection.DoSndIOJob, uses xbx xdi xsi, pIOJob:PIOJOB
   SetObject xsi
 ;  DbgText "NetComConnection.DoSndIOJob", addr [xsi].wName
   mov xdi, pIOJob
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
   invoke WSASend, [xsi].hSocket, addr [xdi].IOJOB.WSABuf, 1, \
                   addr [xdi].IOJOB.dBytesConsumed, 0, xdi, NULL
   .if eax != NO_ERROR                                   ;Did read IO complete synchronously?
@@ -363,7 +370,7 @@ Method NetComConnection.DoSndIOJob, uses xbx xdi xsi, pIOJob:PIOJOB
     OCall xsi.OnError, xdi, ebx                         ;pIOJob
   .endif
 
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 
   mov eax, ebx
 MethodEnd
@@ -375,6 +382,8 @@ MethodEnd
 ; Return:     Nothing.
 ; Note:       This method works worhs together with Done to isolate the call DeleteCriticalSection.
 ;             At this point no pending IOJobs should exist!
+;             Must be called with the CritSect (pCritSect) held, except for a connection that is
+;             not shared and has no IO (NetComEngine.DiscardConnection).
 ;             On the destroy paths the connection is already closed (ReadyToDestroy?,
 ;             NetComEngine.DiscardConnection), so Close posts no completions here.
 
@@ -418,6 +427,14 @@ Method NetComConnection.FreeRessources, uses xbx xdi xsi
     mov xdi, pPrevItem
   .endw
   SDLL_Init xbx
+
+  ;A partner stops using the CritSect of its lock owner. The caller still holds the shared
+  ;CritSect and leaves it through pCritSect, which stays valid until Done.
+  mov xcx, [xsi].pLockOwner
+  .if xcx != NULL
+    dec [xcx].$Obj(NetComConnection).dLockUsers
+    mov [xsi].pLockOwner, NULL
+  .endif
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -468,6 +485,15 @@ Method NetComConnection.Init, uses xsi, pOwner:POINTER, pProtocol:POINTER
 ;  DbgText "NetComConnection.Init", addr [xsi].wName
 
   invoke InitializeCriticalSectionEx, addr [xsi].CritSect, 4000, 0
+  ;CritSect in use: the own one, or the one of the lock owner (NewPartner sets pLockOwner before
+  ;Init). Set once here, it never changes afterwards.
+  mov xcx, [xsi].pLockOwner
+  .if xcx != NULL
+    mov xax, [xcx].$Obj(NetComConnection).pCritSect
+  .else
+    lea xax, [xsi].CritSect
+  .endif
+  mov [xsi].pCritSect, xax
   m2m [xsi].pProtocol, pProtocol, xax
   lea xax, [xsi].RcvIOJobChain
   SDLL_Init xax
@@ -496,6 +522,24 @@ Method NetComConnection.Init, uses xsi, pOwner:POINTER, pProtocol:POINTER
       mov eax, dError
     .endif
   .endif
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComConnection.NewPartner
+; Purpose:    Creates a connection that uses the CritSect of this connection. Both connections are
+;             then processed by one thread at a time, so code working on both (e.g. a proxy that
+;             forwards data between them) cannot run into lock cycles.
+; Arguments:  Arg1: -> NetComProtocol of the new connection.
+; Return:     xax -> New NetComConnection (registered with the IOCP) or NULL if failed.
+; Note:       - Call it with the CritSect of this connection held (e.g. in a protocol callback).
+;             - This connection is destroyed only after all its partners.
+;             - The pairing itself (who belongs to whom) is up to the protocol.
+
+Method NetComConnection.NewPartner, uses xsi, pProtocol:POINTER
+  SetObject xsi
+  mov xcx, [xsi].pOwner                                 ;xcx -> NetComConnectionPool
+  mov xcx, [xcx].$Obj(NetComConnectionPool).pOwner      ;xcx -> NetComEngine
+  OCall xcx::NetComEngine.CreateConnection, pProtocol, xsi
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -878,12 +922,12 @@ MethodEnd
 
 Method NetComConnection.PauseReceive, uses xsi
   SetObject xsi
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
   .ifBitClr [xsi].dFlags, NCC_RCV_PAUSED
     BitSet [xsi].dFlags, NCC_RCV_PAUSED
     invoke GetSystemTimeAsFileTime, addr [xsi].PauseTime
   .endif
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -897,7 +941,7 @@ MethodEnd
 
 Method NetComConnection.ResumeReceive, uses xsi
   SetObject xsi
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
   .ifBitSet [xsi].dFlags, NCC_RCV_PAUSED
     BitClr [xsi].dFlags, NCC_RCV_PAUSED
     invoke GetSystemTimeAsFileTime, addr [xsi].LastTime ;The pause was no peer inactivity
@@ -907,7 +951,7 @@ Method NetComConnection.ResumeReceive, uses xsi
       OCall xsi.QueueReceive                            ;Posts only if none is outstanding
     .endif
   .endif
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -933,7 +977,7 @@ Method NetComConnection.QueueAccept, uses xbx xdi xsi, pListener:PLISTENER
   .endif
   mov xdi, xax
 
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
 
   invoke MemZero, addr [xdi].IOJOB.DataBuffer.ACCEPT_DATA.LocalAddr, sizeof(ACCEPT_DATA.LocalAddr)
   invoke MemZero, addr [xdi].IOJOB.DataBuffer.ACCEPT_DATA.RemoteAddr, sizeof(ACCEPT_DATA.RemoteAddr)
@@ -967,7 +1011,7 @@ Method NetComConnection.QueueAccept, uses xbx xdi xsi, pListener:PLISTENER
     OCall xsi.OnError, xdi, ebx                         ;pIOJob
   .endif
 
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 
   mov eax, ebx
 MethodEnd
@@ -981,9 +1025,9 @@ MethodEnd
 Method NetComConnection.QueueDestroy, uses xsi
   SetObject xsi
 ;  DbgText "NetComConnection.QueueDestroy", addr [xsi].wName
-  invoke EnterCriticalSection, addr [xsi].CritSect      ;dFlags is changed by the workers too
+  invoke EnterCriticalSection, [xsi].pCritSect      ;dFlags is changed by the workers too
   BitSet [xsi].dFlags, NCC_QUEUE_DESTROY
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -991,7 +1035,8 @@ MethodEnd
 ; Purpose:    Checks if a connection flagged with NCC_QUEUE_DESTROY can be destroyed now: no IOJob
 ;             is pending and the posted OnDisconnected/OnClosed completions have been delivered.
 ;             A connection that is not closed yet is closed here (Close posts these completions),
-;             it can be destroyed by a later check.
+;             it can be destroyed by a later check. A lock owner additionally waits until no
+;             partner (NewPartner) uses its CritSect any more.
 ; Arguments:  None.
 ; Return:     eax = TRUE if the connection can be destroyed, otherwise FALSE.
 ; Note:       Must be called with the connection CritSect held. FreeRessources must only follow a
@@ -1015,6 +1060,8 @@ Method NetComConnection.ReadyToDestroy?, uses xsi
         test ecx, NCC_DISCONNECTED_DELIVERED
         jz @@Exit
       @@Ready:
+        cmp [xsi].dLockUsers, 0                         ;A partner still uses our CritSect
+        jne @@Exit
         mov eax, TRUE
       .endif
     .endif
@@ -1071,7 +1118,7 @@ Method NetComConnection.QueueConnect, uses xbx xdi xsi, pRemoteAddr:PNETCOMADDR,
   .endif
   mov xdi, xax
 
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
 
   m2z [xdi].IOJOB.WSABuf.len                            ;Size MUST be zero
   BitClr [xsi].dFlags, NCE_CONNECT
@@ -1096,7 +1143,7 @@ Method NetComConnection.QueueConnect, uses xbx xdi xsi, pRemoteAddr:PNETCOMADDR,
   .endif
   mov ebx, eax
 
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 
   .if ebx != 0
     ;Nothing was queued: return the IOJob. No OnError here, the caller discards the connection.
@@ -1121,7 +1168,7 @@ Method NetComConnection.QueueReceive, uses xsi
   SetObject xsi
 ;  DbgText "NetComConnection.QueueReceive", addr [xsi].wName
   mov dResult, 0
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
   .ifBitClr [xsi].dFlags, NCC_RCV_PAUSED
     .if [xsi].dRcvQueuedIOJobs == 0
       mov xcx, [xsi].pOwner
@@ -1135,7 +1182,7 @@ Method NetComConnection.QueueReceive, uses xsi
       .endif
     .endif
   .endif
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
   mov eax, dResult
 MethodEnd
 
@@ -1163,7 +1210,7 @@ Method NetComConnection.QueueSend, uses xbx xdi xsi, pData:POINTER, dSize:DWORD
 
   ; === TLS Dispatch ===
   .if [xsi].pTLSContext != NULL
-    invoke EnterCriticalSection, addr [xsi].CritSect
+    invoke EnterCriticalSection, [xsi].pCritSect
     mov dResult, 0
     OCall [xsi].pTLSContext::TLS_Context.GetState
     .if eax == TLS_STATE_DATA
@@ -1207,7 +1254,7 @@ Method NetComConnection.QueueSend, uses xbx xdi xsi, pData:POINTER, dSize:DWORD
       .endw
     .endif
     ;TLS_STATE_SHUTDOWN / TLS_STATE_ERROR: nothing is sent, dResult = 0
-    invoke LeaveCriticalSection, addr [xsi].CritSect
+    invoke LeaveCriticalSection, [xsi].pCritSect
     mov eax, dResult
     ExitMethod
   .endif
@@ -1237,7 +1284,7 @@ Method NetComConnection.QueueSendRaw, uses xbx xdi xsi, pData:POINTER, dSize:DWO
 
   ;Application threads call this too: the CritSect keeps the chunks of one call together and
   ;lets OnError (immediate send failure) run serialized with the workers (recursive CritSect)
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
   .while edi != 0
     ;Check if we are allowed to send
     .ifBitSet [xsi].dFlags, NCC_SND_PAUSED or NCC_CLOSED
@@ -1274,7 +1321,7 @@ Method NetComConnection.QueueSendRaw, uses xbx xdi xsi, pData:POINTER, dSize:DWO
   mov eax, dSize
   sub eax, edi
   mov dResult, eax
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
   mov eax, dResult
 MethodEnd
 
@@ -1331,7 +1378,7 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
   local dCopied:DWORD, dChunk:DWORD, dBefore:DWORD, bFirstPass:DWORD, dDeliverResult:DWORD
 
   SetObject xsi
-  invoke EnterCriticalSection, addr [xsi].CritSect
+  invoke EnterCriticalSection, [xsi].pCritSect
 
   ; Cache TLS context pointer
   mov xax, [xsi].pTLSContext
@@ -1578,7 +1625,7 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
   .endif
 
 @@Done:
-  invoke LeaveCriticalSection, addr [xsi].CritSect
+  invoke LeaveCriticalSection, [xsi].pCritSect
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
