@@ -1,9 +1,11 @@
 ; ==================================================================================================
 ; Title:      NetComProtocol.inc
 ; Author:     G. Friedrich
-; Version:    C.1.1
+; Version:    C.1.2
 ; Purpose:    ObjAsm support of NetComProtocol objects.
-; Notes:      Version C.1.1, November 2026
+; Notes:      Version C.1.2, November 2026
+;               - IsDataComplete?: which IOJobs of the receive chains hold valid data.
+;             Version C.1.1, November 2026
 ;               - Allocate: failure contract documented (fail closed for TLS).
 ;             Version C.1.0, October 2017
 ;               - Initial release.
@@ -106,6 +108,10 @@ MethodEnd
 ;                   Positive INT32     - This many bytes are valid buffer information.
 ;                   Zero               - We need more data.
 ; Note:       Zero length packets are NOT passed from the connection to the protocol.
+;             Non-TLS: while IsDataComplete? and ProcessData run, the RcvIOJobChain holds only
+;             completed IOJobs (the next receive is queued afterwards). Code that scans the chain
+;             at any other time must skip IOJobs without IOF_JOB_COMPLETED.
+;             TLS: the decrypted data is in the PlaintextChain; the RcvIOJobChain holds ciphertext.
 
 Method NetComProtocol.IsDataComplete?,, pConnection:$ObjPtr(NetComConnection), pIOJob:PIOJOB
   ANNOTATION use:pConnection pIOJob

@@ -1,9 +1,13 @@
 ; ==================================================================================================
 ; Title:      NetComEngine.inc
 ; Author:     G. Friedrich
-; Version:    C.1.1
+; Version:    C.1.2
 ; Purpose:    ObjAsm support of NetComEngine objects.
-; Notes:      Version C.1.1, November 2026
+; Notes:      Version C.1.2, November 2026
+;               - WorkerJob (no supervisor): destroys through NetComConnection.ReadyToDestroy?;
+;                 a connection not closed yet is closed first instead of being released while
+;                 its OnDisconnected/OnClosed completions are still queued.
+;             Version C.1.1, November 2026
 ;               - NewAcceptor: checks the NetComConnection.Init result; on failure the connection
 ;                 is returned to the pool instead of queuing AcceptEx on an invalid socket.
 ;               - NewConnection: calls Done before returning a failed connection to the pool.
@@ -712,30 +716,15 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
 
       ;NOTE: this code was moved to the supervisor thread, but if not presend, do the disposal here
       .if [xsi].pSupervisor == NULL
-        ;If the connection is flagged for destruction, proceed ONLY if the
-        ;connection has no pending IOJobs AND all async completions delivered
-        .ifBitSet [xdi].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY
-          .if [xdi].$Obj(NetComConnection).dPendingIOJobs == 0
-            ; Warte auf gepostete Completions
-            mov eax, [xdi].$Obj(NetComConnection).dFlags
-            test eax, NCC_DISCONNECT_POSTED
-            .if !ZERO?
-              test eax, NCC_DISCONNECTED_DELIVERED
-              jz @@SkipDestroy
-            .endif
-            test eax, NCC_CLOSED
-            .if !ZERO?
-              test eax, NCC_CLOSED_DELIVERED
-              jz @@SkipDestroy
-            .endif
-
-            OCall xdi::NetComConnection.FreeRessources    ;Socket is closed here
-            invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-            OCall xdi::NetComConnection.Done
-            OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xdi
-            .continue
-          @@SkipDestroy:
-          .endif
+        ;Destroy only if no IOJob is pending and all posted completions were delivered.
+        ;ReadyToDestroy? closes a connection that is not closed yet (destroyed later).
+        OCall xdi::NetComConnection.ReadyToDestroy?
+        .if eax != FALSE
+          OCall xdi::NetComConnection.FreeRessources    ;Protocol data and IOJobs
+          invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+          OCall xdi::NetComConnection.Done
+          OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xdi
+          .continue
         .endif
       .endif
 

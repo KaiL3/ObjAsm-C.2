@@ -62,28 +62,25 @@ MethodEnd
 ;                   Zero               - More data needed.
 ; Note:       Search the last ZTC character in all received buffers.
 
-Method NetComCoreServerProtocol.IsDataComplete?, uses xbx xdi xsi, pConnection:$ObjPtr(NetComConnection)
+Method NetComCoreServerProtocol.IsDataComplete?, uses xbx xdi, pConnection:$ObjPtr(NetComConnection)
   local pRcvIOChain:POINTER
 
 ;  DbgHex pConnection, "NetComCoreServerProtocol.IsDataComplete?", "&PROTOCOL_WND_NAME"
-  ;Compute the first IODATA we want to analyse
+  ;The returned count is taken from the start of the RcvIOJobChain (ProcessData returns it and
+  ;the connection releases that many BYTEs), so the scan always starts at the first IOJob.
   mov xdx, pConnection
-  mov xsi, [xdx].$Obj(NetComConnection).pData
-  mov xax, [xsi].SRVPROTDATA.pNextIOData
   lea xcx, [xdx].$Obj(NetComConnection).RcvIOJobChain
   mov pRcvIOChain, xcx
-
-  .if xax == NULL || xcx == [xax].SDLL_ITEM.pPrevItem
-    mov xbx, [xcx].SDLL_SENTINEL.pFirstItem           ;First item in linked list
-  .else
-    mov xbx, [xax].SDLL_ITEM.pPrevItem
-  .endif
+  mov xbx, [xcx].SDLL_SENTINEL.pFirstItem               ;First item in linked list
 
   ;We will scan for a ZTC character
   xor edx, edx
   xor eax, eax
   .while (xbx != pRcvIOChain)
     ;Stop on first non ready buffer
+    .ifBitClr [xbx - IOJOB_HEADER_SIZE].IOJOB.wFlags, IOF_JOB_COMPLETED
+      .break
+    .endif
     mov xdi, [xbx - IOJOB_HEADER_SIZE].IOJOB.WSABuf.buf
     xor ecx, ecx
     .while ecx < [xbx - IOJOB_HEADER_SIZE].IOJOB.dBytesConsumed
@@ -96,7 +93,6 @@ Method NetComCoreServerProtocol.IsDataComplete?, uses xbx xdi xsi, pConnection:$
     .endw
     mov xbx, [xbx].SDLL_ITEM.pNextItem
   .endw
-  mov [xsi].SRVPROTDATA.pNextIOData, xbx
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------

@@ -1,8 +1,11 @@
 ; ==================================================================================================
 ; Title:      NetComSupervisor.inc
 ; Author:     G. Friedrich
-; Version:    C.1.1
+; Version:    C.1.2
 ; Purpose:    ObjAsm support of NetComSupervisor objects.
+;             Version C.1.2, November 2026
+;               - Destruction is decided by NetComConnection.ReadyToDestroy? under the connection
+;                 CritSect (re-check after TryEnter; a connection not closed yet is closed first).
 ;             Version C.1.1, November 2026
 ;               - Accepted (server) connections are supervised, only pending acceptors are skipped.
 ;               - TLS handshake timeout (dHandshakeTimeout) for the initial handshake.
@@ -248,33 +251,20 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
 
 
       ;If the connection is flagged for destruction, proceed ONLY if the
-      ;connection has no pending IOJobs AND all async completions have been delivered
+      ;connection has no pending IOJobs AND all async completions have been delivered.
+      ;The unlocked tests are a cheap pre-filter, ReadyToDestroy? decides under the CritSect.
       .ifBitSet [xbx].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY
         .if [xbx].$Obj(NetComConnection).dPendingIOJobs == 0
-
-          ; === Warte bis alle geposteten Completions verarbeitet sind ===
-          mov eax, [xbx].$Obj(NetComConnection).dFlags
-
-          ; Falls DISCONNECT gepostet ? muss geliefert sein
-          test eax, NCC_DISCONNECT_POSTED
-          .if !ZERO?
-            test eax, NCC_DISCONNECTED_DELIVERED
-            jz @@Next
-          .endif
-
-          ; Falls Socket geschlossen ? CLOSED muss geliefert sein
-          test eax, NCC_CLOSED
-          .if !ZERO?
-            test eax, NCC_CLOSED_DELIVERED
-            jz @@Next
-          .endif
-          ; === Alle Completions verarbeitet — sicher zerstören ===
-
           invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
           .if eax == FALSE
             jmp @@Next                                  ;Busy => destroy it in the next cycle
           .endif
-          OCall xbx::NetComConnection.FreeRessources    ;Socket is closed here
+          OCall xbx::NetComConnection.ReadyToDestroy?   ;Closes it first if necessary
+          .if eax == FALSE
+            invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+            jmp @@Next
+          .endif
+          OCall xbx::NetComConnection.FreeRessources    ;Protocol data and IOJobs
           invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
           OCall xbx::NetComConnection.Done
           mov xcx, [xsi].pOwner

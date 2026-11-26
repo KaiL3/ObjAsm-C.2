@@ -1,9 +1,20 @@
 ; ==================================================================================================
 ; Title:      NetComConnection.inc
 ; Author:     G. Friedrich
-; Version:    C.1.2
+; Version:    C.1.3
 ; Purpose:    ObjAsm support of NetComConnection objects.
-; Notes:      Version C.1.2, November 2026
+; Notes:      Version C.1.3, November 2026
+;               - Close, Disconnect and QueueDestroy take the connection CritSect: they are called
+;                 from application threads and the engine, concurrent calls posted the
+;                 OnDisconnected/OnClosed completions twice (use after free).
+;               - DoSndIOJob/QueueAccept call OnError before leaving the CritSect; QueueSendRaw
+;                 holds it across all chunks and sends nothing after Close.
+;               - OnReceived (non-TLS): the IOJob of a protocol error is no longer freed while it
+;                 is still linked in the RcvIOJobChain (double free); the next receive is queued
+;                 after the protocol has run, the consumption loop never frees a pending IOJob.
+;               - ReadyToDestroy?: destruction check under the CritSect, closes the connection
+;                 first if necessary (FreeRessources must not post completions).
+;             Version C.1.2, November 2026
 ;               - Init: calls NetComProtocol.Release if the socket cannot be created and returns
 ;                 the error code.
 ;               - QueueConnect/QueueAccept: ConnectEx/AcceptEx return a BOOL; FALSE was always
@@ -151,11 +162,13 @@ MethodEnd
 ;             a FIN/RST to the remote endpoint.
 ; Arguments:  Arg1: Abortive flag (TRUE/FALSE).
 ; Return:     Nothing.
+; Note:       Can be called from any thread while the connection exists (recursive CritSect).
 
 Method NetComConnection.Close, uses xsi, dAbortive:DWORD
   local Linger:linger
 
   SetObject xsi
+  invoke EnterCriticalSection, addr [xsi].CritSect
   .ifBitClr [xsi].dFlags, NCC_CLOSED
 ;    DbgText "NetComConnection.Close", addr [xsi].wName
 
@@ -190,6 +203,7 @@ Method NetComConnection.Close, uses xsi, dAbortive:DWORD
     invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
            0, COMPLETION_KEY_CLOSED, xsi
   .endif
+  invoke LeaveCriticalSection, addr [xsi].CritSect
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -197,6 +211,7 @@ MethodEnd
 ; Purpose:    Disconnect writing and/or reading.
 ; Arguments:  Arg1: Disconnect direction = SD_RECEIVE(0)/SD_SEND(1)/SD_BOTH(2)
 ; Return:     eax = Zero if succeeded, otherwise an error code.
+; Note:       Can be called from any thread while the connection exists (recursive CritSect).
 
 Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
   local dRetValue:DWORD
@@ -204,7 +219,7 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
   SetObject xsi
 ;  DbgText "NetComConnection.Disconnect", addr [xsi].wName
   mov dRetValue, NO_ERROR
-  xor eax, eax
+  invoke EnterCriticalSection, addr [xsi].CritSect
   .ifBitClr [xsi].dFlags, NCC_CLOSED
 
     ;A paused receive would block the graceful close: the peer's FIN or close_notify response
@@ -216,17 +231,14 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
     ; === TLS: Graceful close_notify ===
     ; Serialized with OnReceivedTLS / QueueSend (same security context, recursive CritSect)
     .if [xsi].pTLSContext != NULL && dDirection != SD_RECEIVE
-      invoke EnterCriticalSection, addr [xsi].CritSect
       OCall [xsi].pTLSContext::TLS_Context.GetState
       .if eax == TLS_STATE_DATA
         OCall [xsi].pTLSContext::TLS_Context.Shutdown, xsi
         BitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
         invoke GetSystemTimeAsFileTime, addr [xsi].LastTime
-        invoke LeaveCriticalSection, addr [xsi].CritSect
         ; Kein TCP shutdown hier ù warten auf Peer-Antwort oder Timeout
-        ExitMethod
+        jmp @@Exit
       .endif
-      invoke LeaveCriticalSection, addr [xsi].CritSect
     .endif
 
     ; === Kein TLS oder TLS nicht im DATA-State ===
@@ -256,6 +268,8 @@ Method NetComConnection.Disconnect, uses xsi, dDirection:DWORD
              0, COMPLETION_KEY_DISCONNECTED, xsi
     .endif
   .endif
+@@Exit:
+  invoke LeaveCriticalSection, addr [xsi].CritSect
   mov eax, dRetValue
 MethodEnd
 
@@ -340,11 +354,12 @@ Method NetComConnection.DoSndIOJob, uses xbx xdi xsi, pIOJob:PIOJOB
   .endif
   mov ebx, eax
 
-  invoke LeaveCriticalSection, addr [xsi].CritSect
-
+  ;Report an immediate failure while the CritSect is held (OnError runs protocol code)
   .if ebx != 0
     OCall xsi.OnError, xdi, ebx                         ;pIOJob
   .endif
+
+  invoke LeaveCriticalSection, addr [xsi].CritSect
 
   mov eax, ebx
 MethodEnd
@@ -356,6 +371,8 @@ MethodEnd
 ; Return:     Nothing.
 ; Note:       This method works worhs together with Done to isolate the call DeleteCriticalSection.
 ;             At this point no pending IOJobs should exist!
+;             On the destroy paths the connection is already closed (ReadyToDestroy?,
+;             NetComEngine.DiscardConnection), so Close posts no completions here.
 
 Method NetComConnection.FreeRessources, uses xbx xdi xsi
   local pPrevItem:PSDLL_ITEM, pIOJobPool:$ObjPtr(NetComIOJobPool)
@@ -751,30 +768,28 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
 
   .else
 ;    DbgText "NetComConnection.OnReceived", addr [xsi].wName
-    ;We queue a new read for the one we receive here, unless the receive is paused
-    ;(ResumeReceive posts it later)
-    .ifBitClr [xsi].dFlags, NCC_CLOSED or NCC_QUEUE_DESTROY or NCC_RCV_PAUSED
-      OCall [xbx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.NewItem, IOJOB_RECV
-      .if xax != NULL
-        OCall xsi.DoRcvIOJob, xax                         ;Increments pending IOJobs
-      .else
-;        DbgText "NetComConnection.OnReceived - DoRcvIOJob failed", addr [xsi].wName
-      .endif
-    .endif
 
     ; === TLS Dispatch ===
     .if [xsi].pTLSContext != NULL
+      ;The next receive is queued before the TLS processing. OnReceivedTLS drains only completed
+      ;IOJobs, so a receive that completes synchronously cannot be consumed too early.
+      ;While the receive is paused, ResumeReceive queues it later.
+      .ifBitClr [xsi].dFlags, NCC_CLOSED or NCC_QUEUE_DESTROY
+        OCall xsi.QueueReceive                          ;Only if not paused and none pending
+      .endif
       OCall xsi.OnReceivedTLS, pIOJob
       OCall xsi.CheckRcvLimit                           ;Abort if too much data is unconsumed
       ExitMethod
     .endif
 
     ; === Non-TLS path ===
+    ;The protocol scans the RcvIOJobChain, so the next receive is queued only after it has run.
+    ;A receive queued before could complete synchronously: its data would be in the chain while
+    ;its completion is still queued (IOF_JOB_COMPLETED not set) and could be consumed and freed.
     OCall [xsi].pProtocol::NetComProtocol.IsDataComplete?, xsi, pIOJob
     .if eax == ERROR_BAD_PROTOCOL || eax == ERROR_USER_QUIT
+      ;The IOJob stays linked in the RcvIOJobChain, FreeRessources releases it
       OCall xsi.Disconnect, SD_BOTH
-      mov xcx, [xsi].pOwner
-      OCall [xcx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
       OCall xsi.QueueDestroy
       OCall xsi.Close, TRUE
     .elseif eax != 0
@@ -784,6 +799,9 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
         lea xdi, [xsi].RcvIOJobChain                    ;Sentinel
         mov xbx, [xdi].SDLL_SENTINEL.pFirstItem         ;Get first item
         .while xbx != xdi && dConsumed != 0
+          .ifBitClr [xbx - IOJOB_HEADER_SIZE].IOJOB.wFlags, IOF_JOB_COMPLETED
+            .break                                      ;Never release a pending receive
+          .endif
           mov edx, [xbx - IOJOB_HEADER_SIZE].IOJOB.dBytesConsumed
           .if edx <= dConsumed
             sub dConsumed, edx
@@ -804,6 +822,9 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
       .endif
     .endif
     OCall xsi.CheckRcvLimit                             ;Abort if too much data is unconsumed
+    .ifBitClr [xsi].dFlags, NCC_CLOSED or NCC_QUEUE_DESTROY
+      OCall xsi.QueueReceive                            ;Only if not paused and none pending
+    .endif
   .endif
 MethodEnd
 
@@ -929,11 +950,12 @@ Method NetComConnection.QueueAccept, uses xbx xdi xsi, pListener:PLISTENER
   .endif
   mov ebx, eax
 
-  invoke LeaveCriticalSection, addr [xsi].CritSect
-
+  ;Report an immediate failure while the CritSect is held (OnError runs protocol code)
   .if ebx != 0
     OCall xsi.OnError, xdi, ebx                         ;pIOJob
   .endif
+
+  invoke LeaveCriticalSection, addr [xsi].CritSect
 
   mov eax, ebx
 MethodEnd
@@ -947,7 +969,45 @@ MethodEnd
 Method NetComConnection.QueueDestroy, uses xsi
   SetObject xsi
 ;  DbgText "NetComConnection.QueueDestroy", addr [xsi].wName
+  invoke EnterCriticalSection, addr [xsi].CritSect      ;dFlags is changed by the workers too
   BitSet [xsi].dFlags, NCC_QUEUE_DESTROY
+  invoke LeaveCriticalSection, addr [xsi].CritSect
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComConnection.ReadyToDestroy?
+; Purpose:    Checks if a connection flagged with NCC_QUEUE_DESTROY can be destroyed now: no IOJob
+;             is pending and the posted OnDisconnected/OnClosed completions have been delivered.
+;             A connection that is not closed yet is closed here (Close posts these completions),
+;             it can be destroyed by a later check.
+; Arguments:  None.
+; Return:     eax = TRUE if the connection can be destroyed, otherwise FALSE.
+; Note:       Must be called with the connection CritSect held. FreeRessources must only follow a
+;             TRUE result, otherwise its Close would post completions for a released connection.
+
+Method NetComConnection.ReadyToDestroy?, uses xsi
+  SetObject xsi
+  xor eax, eax
+  .ifBitSet [xsi].dFlags, NCC_QUEUE_DESTROY
+    .if [xsi].dPendingIOJobs == 0
+      .ifBitClr [xsi].dFlags, NCC_CLOSED
+        OCall xsi.Close, TRUE                           ;Abortive, posts the completions
+        xor eax, eax
+      .else
+        ;NCC_CLOSED => OnClosed was posted and must have been delivered
+        mov ecx, [xsi].dFlags
+        test ecx, NCC_CLOSED_DELIVERED
+        jz @@Exit
+        test ecx, NCC_DISCONNECT_POSTED
+        jz @@Ready
+        test ecx, NCC_DISCONNECTED_DELIVERED
+        jz @@Exit
+      @@Ready:
+        mov eax, TRUE
+      .endif
+    .endif
+  .endif
+@@Exit:
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -1154,7 +1214,7 @@ MethodEnd
 ; Return:     eax = Number of queued BYTEs.
 
 Method NetComConnection.QueueSendRaw, uses xbx xdi xsi, pData:POINTER, dSize:DWORD
-  local dBufferSize:DWORD, pItem:PIOJOB
+  local dBufferSize:DWORD, pItem:PIOJOB, dResult:DWORD
 
   SetObject xsi
   mov edi, dSize
@@ -1163,9 +1223,12 @@ Method NetComConnection.QueueSendRaw, uses xbx xdi xsi, pData:POINTER, dSize:DWO
   mov xdx, [xcx].$Obj(NetComConnectionPool).pIOJobPool  ;xdx -> NetComIOJobPool
   m2m dBufferSize, [xdx].$Obj(NetComIOJobPool).dBufferSize, eax
 
+  ;Application threads call this too: the CritSect keeps the chunks of one call together and
+  ;lets OnError (immediate send failure) run serialized with the workers (recursive CritSect)
+  invoke EnterCriticalSection, addr [xsi].CritSect
   .while edi != 0
     ;Check if we are allowed to send
-    .ifBitSet [xsi].dFlags, NCC_SND_PAUSED
+    .ifBitSet [xsi].dFlags, NCC_SND_PAUSED or NCC_CLOSED
       .break
     .endif
 
@@ -1198,6 +1261,9 @@ Method NetComConnection.QueueSendRaw, uses xbx xdi xsi, pData:POINTER, dSize:DWO
   .endw
   mov eax, dSize
   sub eax, edi
+  mov dResult, eax
+  invoke LeaveCriticalSection, addr [xsi].CritSect
+  mov eax, dResult
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------

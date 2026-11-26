@@ -49,6 +49,9 @@
 ;               - NetComEngine.DiscardConnection: releases a connection without IO in flight
 ;                 without posting OnDisconnected/OnClosed (ConnectTo error path).
 ;               - NetComConnection.QueueConnect/QueueAccept: ConnectEx/AcceptEx BOOL result.
+;               - NetComConnection: Close/Disconnect/QueueDestroy thread-safe (CritSect),
+;                 ReadyToDestroy? used by the supervisor and the worker; non-TLS receive path
+;                 fixes (double free on protocol error, receive queued after the protocol).
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -435,6 +438,7 @@ Object NetComConnection, NetComConnectionID, Primer
   VirtualMethod   FreeRessources
 
   VirtualMethod   QueueDestroy
+  StaticMethod    ReadyToDestroy?                       ;Destruction check (CritSect held)
 
   ;Methods to place IO socket jobs or messages on the IOCP queue
   VirtualMethod   QueueAccept,        PLISTENER               ;-> Listener

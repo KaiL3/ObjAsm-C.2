@@ -1,8 +1,12 @@
 ; ==================================================================================================
 ; Title:      SRPS_Supervisor.inc
 ; Author:     G. Friedrich
-; Version:    C.1.1
+; Version:    C.1.2
 ; Purpose:    ObjAsm support of SRPS_Supervisor objects.
+;             Version C.1.2, November 2026
+;               - Destruction through NetComConnection.ReadyToDestroy?: the connection was
+;                 released without waiting for its OnDisconnected/OnClosed completions (use after
+;                 free); a busy connection is skipped instead of restarting the traversal.
 ;             Version C.1.1, November 2026
 ;               - Backpressure uses NetComConnection.PauseReceive/ResumeReceive.
 ;             Version C.1.0, October 2017
@@ -134,17 +138,20 @@ Method NetComSrpsSupervisor.WorkerJob, uses xbx xdi xsi
 
 
       ;If the connection is flagged for destruction, proceed ONLY if the
-      ;connection has no pending IOJobs
+      ;connection has no pending IOJobs AND all async completions have been delivered.
+      ;The unlocked tests are a cheap pre-filter, ReadyToDestroy? decides under the CritSect.
       .ifBitSet [xbx].$Obj(NetComConnection).dFlags, NCC_QUEUE_DESTROY
         .if [xbx].$Obj(NetComConnection).dPendingIOJobs == 0
           invoke TryEnterCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
           .if eax == FALSE
-            mov xcx, [xsi].pOwner
-            invoke LeaveCriticalSection, addr [xcx].$Obj(NetComEngine).ConnectionPool.CritSect
-            invoke Sleep, 10
-            jmp @@Retry
+            jmp @@Next                                  ;Busy => destroy it in the next cycle
           .endif
-          OCall xbx::NetComConnection.FreeRessources    ;Socket is closed here
+          OCall xbx::NetComConnection.ReadyToDestroy?   ;Closes it first if necessary
+          .if eax == FALSE
+            invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+            jmp @@Next
+          .endif
+          OCall xbx::NetComConnection.FreeRessources    ;Protocol data and IOJobs
           invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
           OCall xbx::NetComConnection.Done
           mov xcx, [xsi].pOwner
