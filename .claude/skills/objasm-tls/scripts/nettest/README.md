@@ -29,6 +29,7 @@ so `Add-Type` never meets an older compiled `SrpsProbe.cs` in the same session.
 | `garbagetest.ps1 -Port 25774` | running TLS Test server | TLS handshake + echo, then a garbage TLS record on the raw stream: the server must reset the connection at once (decrypt error path) |
 | `tlsbench.ps1` | starts the TLS Test server | `nettest.ps1 -Mode tls` with wall time and server CPU (user/kernel) |
 | `srpstest.ps1` | starts TLS Test server + SRPS, configures and starts SRPS through its dialog | bidirectional TLS clients through the proxy, see below |
+| `stressclienttest.ps1` | starts Stress Test server + client, drives the client's send dialog | connection lifetime vs. application threads (O17): server killed while the client streams, Disconnect on the destroyed connection, regular cycle, exit (answers the exit prompt); prints windows and wait chains if the exit hangs |
 
 `srpstest.ps1` parameters:
 

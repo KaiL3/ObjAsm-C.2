@@ -44,6 +44,11 @@ TLS_DefaultCertValidator`. Library order is in `Code/Objects/Build/ObjectsX.lst`
    CritSect of its lock owner, so a connection pair (e.g. SRPS client/server side) is processed by
    one thread at a time and code working on both sides cannot form lock cycles. The lock owner is
    destroyed only after its partners (`dLockUsers`).
+   **Application threads never use a stored connection pointer directly**: the engine destroys
+   connections at any time and the pool even releases their memory. Keep (pointer,
+   `dConnectionId`) - `ConnectTo` returns the ID in edx - and work between
+   `NetComEngine.AcquireConnection` (TRUE = still alive, lock held) and `ReleaseConnection`, or
+   iterate `ConnectionChain` under the pool lock with TryEnter on each connection.
 2. **Receive order comes from `RcvIOJobChain`**, not from completion order. `OnReceivedTLS` drains
    only consecutive IOJobs flagged `IOF_JOB_COMPLETED` into the reassembly buffer.
 3. **Reassembly buffer ownership.** `pReassemblyBuffer/dReassemblyUsed` belong to the context but are
