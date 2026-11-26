@@ -127,7 +127,7 @@ NetCom does **not** create or free TLS contexts. In the protocol object:
 
 ## Verifying
 
-TLS test programs: `Projects/X/NetCom/TLS Test` (server + client, untracked in git as of 2026-11-25).
+TLS test programs: `Projects/X/NetCom/TLS Test` (server + client, in git since b843a1b8).
 Since 1.1.0 both have File > Settings (TLS versions, ciphers, mutual auth, certificate search,
 timeouts, receive limit; stored in `<exe>.ini`), shared code in `TLS_TestCommon.inc` /
 `TLS_TestSettingsDlg.inc/.rc`, server echo + Actions menu (pause/resume/disconnect/abort), client
@@ -150,7 +150,11 @@ bash .claude/skills/objasm-tls/scripts/assemble_tls.sh "<scratch dir>"
 The script assembles (no lib, nothing in the repo is touched) every TLS/NetCom object for
 64W/64A/32W/32A into `<scratch dir>/<variant>` and prints the first errors per object.
 
-Assembling proves syntax and macro expansion only. Behaviour needs a running client/server: test
+Assembling proves syntax and macro expansion only. Behaviour needs a running client/server.
+Ready-made runtime tests are in **`scripts/nettest/`** (see its README): pipelined load with resets
+against the Core Test and TLS Test servers, shutdown under load, a garbage TLS record, and SRPS with
+bidirectional TLS clients, slow readers, shutdown and inactivity timeout, plus a deadlock check via
+Wait Chain Traversal. Use release builds (no `DEBUG(WND)`) and moderate load. Beyond that, test
 against `openssl s_server`/`s_client` or `curl -v --resolve host:port:127.0.0.1`, including SNI with
 a large ClientHello, mutual auth, peer close_notify, local Disconnect, and TLS 1.3 on Windows 11 /
 Server 2022 (Windows 10 SChannel does not negotiate TLS 1.3).
