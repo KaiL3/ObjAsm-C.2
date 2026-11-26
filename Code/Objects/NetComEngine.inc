@@ -17,6 +17,7 @@
 ;                 (queued accept completions refer to them); Done closes the listeners first.
 ;               - WorkerJob: no stale completion key if GetQueuedCompletionStatus dequeues no
 ;                 packet; OnClosed is not delivered before OnDisconnected.
+;               - StartListening: returns the error if not a single acceptor could be queued.
 ;             Version C.1.1, November 2026
 ;               - NewAcceptor: checks the NetComConnection.Init result; on failure the connection
 ;                 is returned to the pool instead of queuing AcceptEx on an invalid socket.
@@ -593,7 +594,12 @@ Method NetComEngine.StartListening, uses xbx xdi xsi, dAcceptorCount:DWORD, \
   test edi, edi
   .while !ZERO?
     OCall xsi.NewAcceptor, xbx, pProtocol               ;Returns eax = error code
-    .break .if eax != NO_ERROR && eax != ERROR_IO_PENDING
+    .if eax != NO_ERROR && eax != ERROR_IO_PENDING
+      .if edi == dAcceptorCount
+        mov dRetValue, eax                              ;Not a single acceptor => report it
+      .endif
+      .break
+    .endif
     dec xdi
   .endw
 

@@ -5,6 +5,7 @@
 ; Purpose:    ObjAsm support of NetComProtocol objects.
 ; Notes:      Version C.1.2, November 2026
 ;               - IsDataComplete?: which IOJobs of the receive chains hold valid data.
+;               - OnError: NULL arguments documented.
 ;             Version C.1.1, November 2026
 ;               - Allocate: failure contract documented (fail closed for TLS).
 ;             Version C.1.0, October 2017
@@ -197,10 +198,11 @@ MethodEnd
 ; --------------------------------------------------------------------------------------------------
 ; Method:     NetComProtocol.OnError
 ; Purpose:    Error notification handler.
-; Arguments:  Arg1: -> NetComConnection.
-;             Arg2: -> IOJob.
+; Arguments:  Arg1: -> NetComConnection. NULL for listener errors (NetComEngine.StartListening).
+;             Arg2: -> IOJob, or NULL for errors without an IO operation (timeouts, TLS errors,
+;                   receive limit). The connection then handles the error itself.
 ;             Arg3: Error code.
-; Return:     eax = Command (PROT_CMD_NONE, PROT_CMD_DESTROY, ...)
+; Return:     eax = Command (PROT_CMD_NONE, PROT_CMD_DESTROY, ...), only used if Arg2 != NULL.
 
 Method NetComProtocol.OnError,, pConnection:$ObjPtr(NetComConnection), pIOJob:PIOJOB, dError:DWORD
   ANNOTATION use:pConnection dError

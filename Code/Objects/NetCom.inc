@@ -57,6 +57,8 @@
 ;               - NetComSupervisor: no protocol callbacks while the pool lock is held.
 ;               - NetComEngine: RetiredListeners (listener memory kept until the workers have
 ;                 stopped); NetComConnection.OnAccepted re-arms only open listeners.
+;               - NetComConnection: TLS error paths abort the connection; NetComEngine:
+;                 StartListening reports a failure to queue any acceptor.
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================

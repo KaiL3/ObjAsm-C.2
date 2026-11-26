@@ -15,6 +15,9 @@
 ;               - ReadyToDestroy?: destruction check under the CritSect, closes the connection
 ;                 first if necessary (FreeRessources must not post completions).
 ;               - OnAccepted: no new acceptor on a closed listener.
+;               - TLS error paths (handshake start in OnConnected, decrypt error, IO errors after
+;                 the local TLS shutdown) abort the connection instead of leaving it alive until
+;                 a supervisor timeout (forever without supervisor).
 ;             Version C.1.2, November 2026
 ;               - Init: calls NetComProtocol.Release if the socket cannot be created and returns
 ;                 the error code.
@@ -589,7 +592,8 @@ Method NetComConnection.OnConnected, uses xsi, pIOJob:PIOJOB
       mov dTLSError, eax
       OCall [xsi].pProtocol::NetComProtocol.OnHandshakeFailed, xsi, dTLSError
       OCall [xsi].pProtocol::NetComProtocol.OnError, xsi, NULL, dTLSError
-      OCall xsi.Disconnect, SD_BOTH
+      OCall xsi.QueueDestroy                            ;Like Admit: no plaintext fallback
+      OCall xsi.Close, TRUE
       ExitMethod
     .endif
 
@@ -645,6 +649,10 @@ Method NetComConnection.OnError, uses xbx xdi xsi, pIOJob:PIOJOB, dError:DWORD
         SDLL_Remove xax, xcx, xdx
       .endif
       OCall [xdi].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, xbx
+      ;The shutdown cannot complete any more (no receive pending, the send side is broken):
+      ;abort without notifying the protocol instead of waiting for a supervisor timeout
+      OCall xsi.QueueDestroy
+      OCall xsi.Close, TRUE
       ExitMethod
     .endif
   .endif
@@ -1498,9 +1506,11 @@ Method NetComConnection.OnReceivedTLS, uses xbx xdi xsi, pIOJob:PIOJOB
         addr pPlaintext, addr dPlaintextSize
 
   .if eax != OBJ_OK
-    ; Fatal decrypt error: the TLS stream is unusable => report and disconnect
+    ; Fatal decrypt error: the TLS stream is unusable => report and abort (a graceful
+    ; disconnect left the connection alive until a supervisor timeout)
     OCall [xsi].pProtocol::NetComProtocol.OnError, xsi, NULL, TLS_DECRYPT_ERROR
-    OCall xsi.Disconnect, SD_BOTH
+    OCall xsi.QueueDestroy
+    OCall xsi.Close, TRUE
     jmp @@Done
   .endif
 
