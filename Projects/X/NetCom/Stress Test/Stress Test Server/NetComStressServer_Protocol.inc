@@ -52,6 +52,9 @@ SRVPROTDATA ends
 ;             - All protocol state is released when the connection is closed.
 
 Object NetComStressServerProtocol,, NetComProtocol
+  ;A transmission (screenshot, up to about 33 MB for a 4K screen) is processed only when it is
+  ;complete, so the receive limit must hold a whole one (the default of 1 MB aborted every one)
+  RedefineVariable dMaxRcvBuffered,   64*1024*1024
   RedefineMethod  Allocate,           $ObjPtr(NetComConnection)
   RedefineMethod  IsDataComplete?,    $ObjPtr(NetComConnection), PIOJOB
   RedefineMethod  OnAccepted,         $ObjPtr(NetComConnection)
