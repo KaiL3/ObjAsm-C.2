@@ -14,6 +14,7 @@
 ;                 after the protocol has run, the consumption loop never frees a pending IOJob.
 ;               - ReadyToDestroy?: destruction check under the CritSect, closes the connection
 ;                 first if necessary (FreeRessources must not post completions).
+;               - OnAccepted: no new acceptor on a closed listener.
 ;             Version C.1.2, November 2026
 ;               - Init: calls NetComProtocol.Release if the socket cannot be created and returns
 ;                 the error code.
@@ -538,8 +539,11 @@ Method NetComConnection.OnAccepted, uses xbx xdi xsi, pIOJob:PIOJOB
     ;Notify the NetComConnection's Protocol handler
     OCall [xsi].pProtocol::NetComProtocol.OnAccepted, xsi
 
-    ;Create a new acceptor
-    OCall xdi::NetComEngine.NewAcceptor, [xbx].IOJOB.DataBuffer.ACCEPT_DATA.pListener, [xsi].pProtocol
+    ;Create a new acceptor, unless the listener was closed (StopListening / engine Done)
+    mov xax, [xbx].IOJOB.DataBuffer.ACCEPT_DATA.pListener
+    .if [xax].LISTENER.hSocket != INVALID_SOCKET
+      OCall xdi::NetComEngine.NewAcceptor, xax, [xsi].pProtocol
+    .endif
   .endif
 
   OCall [xdi].$Obj(NetComEngine).IOJobPool::NetComIOJobPool.FreeItem, xbx

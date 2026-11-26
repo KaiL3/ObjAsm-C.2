@@ -7,6 +7,16 @@
 ;               - WorkerJob (no supervisor): destroys through NetComConnection.ReadyToDestroy?;
 ;                 a connection not closed yet is closed first instead of being released while
 ;                 its OnDisconnected/OnClosed completions are still queued.
+;               - LeaveConnection: new; the destroy check also runs after the synthetic
+;                 OnDisconnected/OnClosed completions (without a supervisor, connections were
+;                 practically never destroyed).
+;               - ConnectionsApply: new; ConnectionsClose/Destroy/Disconnect use it. They blocked
+;                 on connection CritSects under the pool lock (deadlock with OnAccepted ->
+;                 NewAcceptor); Disconnect is applied only once per connection.
+;               - Closed listeners are kept in RetiredListeners until the workers have stopped
+;                 (queued accept completions refer to them); Done closes the listeners first.
+;               - WorkerJob: no stale completion key if GetQueuedCompletionStatus dequeues no
+;                 packet; OnClosed is not delivered before OnDisconnected.
 ;             Version C.1.1, November 2026
 ;               - NewAcceptor: checks the NetComConnection.Init result; on failure the connection
 ;                 is returned to the pool instead of queuing AcceptEx on an invalid socket.
@@ -73,25 +83,33 @@ WsaErrBox endp
 ; --------------------------------------------------------------------------------------------------
 ; Method:     ListenerCollection.DestroyItem
 ; Purpose:    Auxiliar function to dispose a listener from the collection. Don't call directly!
+;             The listening socket is closed (pending AcceptEx operations are aborted). The LISTENER
+;             memory is moved to NetComEngine.RetiredListeners and released by NetComEngine.Done
+;             after the workers have stopped, since queued accept completions still refer to it.
 ; Arguments:  Arg1: -> Listener.
 ; Return:     Nothing.
 
 Method ListenerCollection.DestroyItem, uses xbx, pListener:PLISTENER
-  local Linger:linger
+  local Linger:linger, hSocket:SOCKET
 
   DbgText "ListenerCollection.DestroyItem"
   mov xbx, pListener
   .if xbx != NULL
-    .if [xbx].LISTENER.hSocket != INVALID_SOCKET
+    mov xax, [xbx].LISTENER.hSocket
+    .if xax != INVALID_SOCKET
+      ;Mark it closed first: OnAccepted does not re-arm an acceptor on a closed listener
+      mov hSocket, xax
+      mov [xbx].LISTENER.hSocket, INVALID_SOCKET
       ;Perform an "abortive close" of the socket, just in case.
       mov Linger.l_onoff, 1
       mov Linger.l_linger, 0
-      invoke setsockopt, [xbx].LISTENER.hSocket, SOL_SOCKET, SO_LINGER, \
-                         addr Linger, sizeof Linger
+      invoke setsockopt, hSocket, SOL_SOCKET, SO_LINGER, addr Linger, sizeof Linger
       DbgOnSockError "ListenerCollection.DestroyItem - ERROR on SetSockOpt SO_LINGER"
-      invoke closesocket, [xbx].LISTENER.hSocket
+      invoke closesocket, hSocket
     .endif
-    MemFree xbx                                         ;Frees data from heap
+    mov xax, pSelf                                      ;xax -> Listeners (DataCollection)
+    mov xcx, [xax].$Obj(DataCollection).pOwner          ;xcx -> NetComEngine
+    OCall [xcx].$Obj(NetComEngine).RetiredListeners::DataCollection.Insert, xbx
   .endif
 MethodEnd
 
@@ -102,67 +120,90 @@ MethodEnd
 ; ==================================================================================================
 
 ; --------------------------------------------------------------------------------------------------
-; Method:     NetComEngine.ConnectionsClose
-; Purpose:    Closes all connections.
-; Arguments:  None.
-; Return:     Nothing.
-; Note:       Very unsafe!
+; Method:     NetComEngine.ConnectionsApply
+; Purpose:    Applies an action to all connections.
+;             A worker can hold a connection CritSect and wait for the pool lock (OnAccepted ->
+;             NewAcceptor). Therefore a connection is entered only with TryEnterCriticalSection
+;             while the pool lock is held; busy connections are handled in a further pass after
+;             the pool lock was released for a moment.
+; Arguments:  Arg1: Action: NCE_APPLY_CLOSE, NCE_APPLY_DESTROY or NCE_APPLY_DISCONNECT.
+; Return:     eax = Number of connections that were still busy after the last pass (0 = all).
+; Note:       NCE_APPLY_DISCONNECT disconnects each connection only once (SD_SEND): a second
+;             Disconnect of a TLS connection would cut a pending close_notify exchange.
 
-Method NetComEngine.ConnectionsClose, uses xbx xdi xsi
+Method NetComEngine.ConnectionsApply, uses xbx xdi xsi, dAction:DWORD
+  local dBusy:DWORD, dPass:DWORD, pConnection:$ObjPtr(NetComConnection)
+
   SetObject xsi
-  invoke EnterCriticalSection, addr [xsi].ConnectionPool.CritSect
-  lea xdi, [xsi].ConnectionChain                        ;xdi -> SENTINEL
-  mov xbx, [xdi].SDLL_SENTINEL.pFirstItem               ;Get first item
-  .while xbx != xdi                                     ;Empty?
-    lea xcx, [xbx - offset($Obj(NetComConnection).ChainItem)]
-    mov xbx, [xbx].SDLL_ITEM.pNextItem                  ;Move to next item
-    OCall xcx::NetComConnection.Close, FALSE
+  mov dPass, 0
+  .while TRUE
+    mov dBusy, 0
+    invoke EnterCriticalSection, addr [xsi].ConnectionPool.CritSect
+    lea xdi, [xsi].ConnectionChain                      ;xdi -> SENTINEL
+    mov xbx, [xdi].SDLL_SENTINEL.pFirstItem             ;Get first item
+    .while xbx != xdi                                   ;Empty?
+      lea xax, [xbx - offset($Obj(NetComConnection).ChainItem)]
+      mov pConnection, xax
+      mov xbx, [xbx].SDLL_ITEM.pNextItem                ;Move to next item
+      invoke TryEnterCriticalSection, addr [xax].$Obj(NetComConnection).CritSect
+      .if eax == FALSE
+        inc dBusy                                       ;Busy => next pass
+      .else
+        mov xcx, pConnection
+        .if dAction == NCE_APPLY_DISCONNECT
+          .ifBitClr [xcx].$Obj(NetComConnection).dFlags, NCC_CLOSED or NCC_TLS_SHUTDOWN_PENDING or \
+                                                         NCC_SHUTDOWN_SND_LOCAL
+            OCall pConnection::NetComConnection.Disconnect, SD_SEND
+          .endif
+        .elseif dAction == NCE_APPLY_DESTROY
+          OCall pConnection::NetComConnection.QueueDestroy
+        .else
+          OCall pConnection::NetComConnection.Close, FALSE
+        .endif
+        mov xcx, pConnection
+        invoke LeaveCriticalSection, addr [xcx].$Obj(NetComConnection).CritSect
+      .endif
+    .endw
+    invoke LeaveCriticalSection, addr [xsi].ConnectionPool.CritSect
+    .break .if dBusy == 0
+    inc dPass
+    .break .if dPass >= NCE_APPLY_MAX_PASSES
+    invoke Sleep, 10                                    ;Let the busy threads continue
   .endw
-  invoke LeaveCriticalSection, addr [xsi].ConnectionPool.CritSect
+  mov eax, dBusy
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComEngine.ConnectionsClose
+; Purpose:    Closes all connections (graceful).
+; Arguments:  None.
+; Return:     eax = Number of connections that could not be handled (busy), see ConnectionsApply.
+
+Method NetComEngine.ConnectionsClose, uses xsi
+  SetObject xsi
+  OCall xsi.ConnectionsApply, NCE_APPLY_CLOSE
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
 ; Method:     NetComEngine.ConnectionsDestroy
-; Purpose:    Destroy all connections.
+; Purpose:    Marks all connections for destruction.
 ; Arguments:  None.
-; Return:     Nothing.
-; Note:       Very unsafe!
+; Return:     eax = Number of connections that could not be handled (busy), see ConnectionsApply.
 
-Method NetComEngine.ConnectionsDestroy, uses xbx xdi xsi
-  local pConnection:$ObjPtr(NetComConnection)
-
+Method NetComEngine.ConnectionsDestroy, uses xsi
   SetObject xsi
-  invoke EnterCriticalSection, addr [xsi].ConnectionPool.CritSect
-  lea xdi, [xsi].ConnectionChain                        ;xdi -> SENTINEL
-  mov xbx, [xdi].SDLL_SENTINEL.pFirstItem               ;Get first item
-  .while xbx != xdi                                     ;Empty?
-    lea xcx, [xbx - offset($Obj(NetComConnection).ChainItem)]
-    mov pConnection, xcx
-    mov xbx, [xbx].SDLL_ITEM.pNextItem                  ;Move to next item
-    OCall pConnection::NetComConnection.QueueDestroy
-  .endw
-  invoke LeaveCriticalSection, addr [xsi].ConnectionPool.CritSect
+  OCall xsi.ConnectionsApply, NCE_APPLY_DESTROY
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
 ; Method:     NetComEngine.ConnectionsDisconnect
-; Purpose:    Disconnects all connections.
+; Purpose:    Disconnects all connections (SD_SEND; TLS connections send a close_notify).
 ; Arguments:  None.
-; Return:     Nothing.
-; Note:       Very unsafe!
+; Return:     eax = Number of connections that could not be handled (busy), see ConnectionsApply.
 
-Method NetComEngine.ConnectionsDisconnect, uses xbx xdi xsi
+Method NetComEngine.ConnectionsDisconnect, uses xsi
   SetObject xsi
-  invoke EnterCriticalSection, addr [xsi].ConnectionPool.CritSect
-  lea xdi, [xsi].ConnectionChain                        ;xdi -> SENTINEL
-  mov xdx, [xdi].SDLL_SENTINEL.pFirstItem               ;Get first Item
-  .while xdx != xdi
-    mov xbx, [xdx].SDLL_ITEM.pNextItem
-    lea xcx, [xdx - offset($Obj(NetComConnection).ChainItem)]
-    OCall xcx::NetComConnection.Disconnect, SD_SEND
-    mov xdx, xbx
-  .endw
-  invoke LeaveCriticalSection, addr [xsi].ConnectionPool.CritSect
+  OCall xsi.ConnectionsApply, NCE_APPLY_DISCONNECT
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -231,13 +272,13 @@ Method NetComEngine.Done, uses xbx xdi xsi
 ;  DbgText "NetComEngine.Done"
   ;Teardown all connections — graceful TLS shutdown
   DbgLine2
+  ;Stop accepting first, so no new connections arrive during the teardown. The LISTENER memory
+  ;stays in RetiredListeners until the workers have stopped.
+  OCall [xsi].Listeners::DataCollection.Done
   OCall xsi.ConnectionsDisconnect                       ;Sends TLS close_notify + TCP FIN
   invoke Sleep, 500                                     ;Give worker time to send close_notify
   OCall xsi.ConnectionsDestroy                          ;Mark all for destruction
   OCall xsi.ConnectionsClose                            ;Close all sockets (abortive if needed)
-
-  ;Close listener sockets and release DataCollection structures
-  OCall [xsi].Listeners::DataCollection.Done
 
   mov xax, [xsi].pSupervisor
   .if xax != NULL
@@ -285,6 +326,9 @@ Method NetComEngine.Done, uses xbx xdi xsi
   .if [xsi].pSupervisor != NULL
     OCall [xsi].pSupervisor::NetComSupervisor.Done
   .endif
+
+  ;No completion can refer to a closed listener any more
+  OCall [xsi].RetiredListeners::DataCollection.Done
 
   ;Destroy IOCP
   invoke CloseHandle, [xsi].hIOCP
@@ -334,6 +378,7 @@ Method NetComEngine.Init, uses xbx xsi, pOwner:POINTER, pSupervisor:POINTER, \
   OCall xbx::NetComIOJobPool.Init, xsi, dAllocIOJobs, dIOJobBufferSize
   OCall [xsi].ConnectionPool::NetComConnectionPool.Init, xsi, dAllocConnections, xbx
   OCall [xsi].Listeners::DataCollection.Init, xsi, 5, 5, COL_MAX_CAPACITY
+  OCall [xsi].RetiredListeners::DataCollection.Init, xsi, 5, 5, COL_MAX_CAPACITY
   invoke GetSystemInfo, addr SysInfo
   mrm [xsi].dWorkerCount, SysInfo.dwNumberOfProcessors, eax   ;Number of logical processors
 ;  mrm [xsi].dWorkerCount, 1, eax
@@ -371,6 +416,32 @@ Method NetComEngine.Init, uses xbx xsi, pOwner:POINTER, pSupervisor:POINTER, \
 
 @@Exit:
   mov eax, dRetValue
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComEngine.LeaveConnection
+; Purpose:    Leaves the connection CritSect after a completion. Without a supervisor, a connection
+;             that is ready to be destroyed (NetComConnection.ReadyToDestroy?) is destroyed here and
+;             returned to the pool; with a supervisor, the supervisor does it.
+; Arguments:  Arg1: -> NetComConnection. Its CritSect is held once by the calling worker.
+; Return:     Nothing.
+; Note:       Also called after the synthetic OnDisconnected/OnClosed completions: they are usually
+;             the last events of a connection and their delivery is required for destruction.
+
+Method NetComEngine.LeaveConnection, uses xbx xsi, pConnection:$ObjPtr(NetComConnection)
+  SetObject xsi
+  mov xbx, pConnection
+  .if [xsi].pSupervisor == NULL
+    OCall xbx::NetComConnection.ReadyToDestroy?         ;Closes it first if necessary
+    .if eax != FALSE
+      OCall xbx::NetComConnection.FreeRessources        ;Protocol data and IOJobs
+      invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
+      OCall xbx::NetComConnection.Done
+      OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx
+      ExitMethod
+    .endif
+  .endif
+  invoke LeaveCriticalSection, addr [xbx].$Obj(NetComConnection).CritSect
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -603,10 +674,18 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
     ;One is the "completion key" of the completed IO, the other is a POINTER to the IOJob
     ;which represents the IO operation which was completed.
     ;Note: never abort if GetQueuedCompletionStatus returns FALSE!
+    mov pIOJob, NULL                                    ;Both are not written if no packet
+    mov xCompletionKey, 0                               ;is dequeued
     invoke GetQueuedCompletionStatus, [xsi].hIOCP, addr dBytesTransfered, addr xCompletionKey, \
                                       addr pIOJob, INFINITE
+    .if eax == FALSE && pIOJob == NULL
+      ;No packet was dequeued (a failed IO has pIOJob != NULL): the key is not valid
+      invoke GetLastError
+      .break .if eax == ERROR_ABANDONED_WAIT_0 || eax == ERROR_INVALID_HANDLE   ;IOCP closed
+      .continue
+    .endif
 
-    ;Exit thread loop immediately if the call fails or COMPLETION_KEY_KILL_WORKER received
+    ;Exit thread loop immediately if COMPLETION_KEY_KILL_WORKER received
     .break .if xCompletionKey == COMPLETION_KEY_KILL_WORKER
 
     ; ??????????????????????????????????????????????????????????????????????????
@@ -625,7 +704,7 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
         ;without 'uses xdi'. pIOJob holds the Connection pointer for synthetic keys.
         mov xdi, pIOJob
         lock or [xdi].$Obj(NetComConnection).dFlags, NCC_DISCONNECTED_DELIVERED
-        invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+        OCall xsi.LeaveConnection, xdi                  ;Destroys it if ready (no supervisor)
       .else
         ; CritSect belegt — Re-Post ans Ende der IOCP-Queue
         invoke PostQueuedCompletionStatus, [xsi].hIOCP, \
@@ -637,12 +716,21 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
       mov xdi, pIOJob                                    ;xdi -> NetComConnection
       invoke TryEnterCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
       .if eax != FALSE
+        ;Keep the order OnDisconnected -> OnClosed: a re-posted DISCONNECTED completion can
+        ;arrive after this one
+        mov eax, [xdi].$Obj(NetComConnection).dFlags
+        and eax, NCC_DISCONNECT_POSTED or NCC_DISCONNECTED_DELIVERED
+        .if eax == NCC_DISCONNECT_POSTED
+          invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+          invoke PostQueuedCompletionStatus, [xsi].hIOCP, 0, COMPLETION_KEY_CLOSED, xdi
+          .continue
+        .endif
         OCall [xdi].$Obj(NetComConnection).pProtocol::NetComProtocol.OnClosed, xdi
         mov xsi, pEngine                                 ;Restore Engine pointer
         ;Restore xdi from pIOJob — same reason as above
         mov xdi, pIOJob
         lock or [xdi].$Obj(NetComConnection).dFlags, NCC_CLOSED_DELIVERED
-        invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+        OCall xsi.LeaveConnection, xdi                  ;Destroys it if ready (no supervisor)
       .else
         ; CritSect belegt — Re-Post
         invoke PostQueuedCompletionStatus, [xsi].hIOCP, \
@@ -714,21 +802,8 @@ Method NetComEngine.WorkerJob, uses xbx xdi xsi
 
       .endif
 
-      ;NOTE: this code was moved to the supervisor thread, but if not presend, do the disposal here
-      .if [xsi].pSupervisor == NULL
-        ;Destroy only if no IOJob is pending and all posted completions were delivered.
-        ;ReadyToDestroy? closes a connection that is not closed yet (destroyed later).
-        OCall xdi::NetComConnection.ReadyToDestroy?
-        .if eax != FALSE
-          OCall xdi::NetComConnection.FreeRessources    ;Protocol data and IOJobs
-          invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
-          OCall xdi::NetComConnection.Done
-          OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xdi
-          .continue
-        .endif
-      .endif
-
-      invoke LeaveCriticalSection, addr [xdi].$Obj(NetComConnection).CritSect
+      ;Without a supervisor, the connection is destroyed here as soon as it is ready
+      OCall xsi.LeaveConnection, xdi
     .endif
 
   .endw

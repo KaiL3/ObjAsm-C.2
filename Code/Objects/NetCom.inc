@@ -52,6 +52,11 @@
 ;               - NetComConnection: Close/Disconnect/QueueDestroy thread-safe (CritSect),
 ;                 ReadyToDestroy? used by the supervisor and the worker; non-TLS receive path
 ;                 fixes (double free on protocol error, receive queued after the protocol).
+;               - NetComEngine: ConnectionsApply (no blocking on connections under the pool
+;                 lock), LeaveConnection (destroy check also after synthetic completions).
+;               - NetComSupervisor: no protocol callbacks while the pool lock is held.
+;               - NetComEngine: RetiredListeners (listener memory kept until the workers have
+;                 stopped); NetComConnection.OnAccepted re-arms only open listeners.
 ;             Version C.1.0, October 2017
 ;               - Initial release.
 ; ==================================================================================================
@@ -287,6 +292,12 @@ COMPLETION_KEY_KILL_WORKER    equ   -2
 COMPLETION_KEY_SOCK_ACCEPTED  equ   -3
 COMPLETION_KEY_DISCONNECTED   equ   -4      ;Async OnDisconnected via IOCP
 COMPLETION_KEY_CLOSED         equ   -5      ;Async OnClosed via IOCP
+
+;NetComEngine.ConnectionsApply actions
+NCE_APPLY_CLOSE               equ   0
+NCE_APPLY_DESTROY             equ   1
+NCE_APPLY_DISCONNECT          equ   2
+NCE_APPLY_MAX_PASSES          equ   100     ;Passes (10 ms apart) while connections are busy
 
 AcceptEx proto WIN_STD_CALL_CONV :SOCKET,:SOCKET,:PVOID,:DWORD,:DWORD,:DWORD,:LPDWORD,:LPOVERLAPPED
 TYPE_CONNECTEX typedef proto :HANDLE, :POINTER, :DWORD, :POINTER, :DWORD, :POINTER, :LPOVERLAPPED
@@ -593,10 +604,12 @@ Object NetComEngine, NetComEngineID, Primer
   VirtualMethod   ConnectionsClose
   VirtualMethod   ConnectionsDisconnect
   VirtualMethod   ConnectionsDestroy
+  StaticMethod    ConnectionsApply,   DWORD                   ;NCE_APPLY_xxx
   VirtualMethod   ConnectTo,          $ObjPtr(NetComProtocol), PNETCOMADDR, PNETCOMADDR
   StaticMethod    DiscardConnection,  $ObjPtr(NetComConnection)
   RedefineMethod  Done
   RedefineMethod  Init,               POINTER, POINTER, DWORD, DWORD, DWORD
+  StaticMethod    LeaveConnection,    $ObjPtr(NetComConnection)
   VirtualMethod   NewConnection,      $ObjPtr(NetComProtocol)
   VirtualMethod   NewAcceptor,        PLISTENER, $ObjPtr(NetComProtocol)
   StaticMethod    WorkerJob
@@ -619,6 +632,7 @@ Object NetComEngine, NetComEngineID, Primer
   Embed ConnectionPool, NetComConnectionPool            ;Pool of NetComConnections
   Embed IOJobPool,      NetComIOJobPool                 ;IOJob Pool
   Embed Listeners,      DataCollection                  ;DataCollection of listening sockets
+  Embed RetiredListeners, DataCollection                ;Closed listeners, released in Done
   Embed Workers,        XWCollection                    ;Collection of Worker thread HANDLEs
 ObjectEnd
 

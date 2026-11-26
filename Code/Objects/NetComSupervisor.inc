@@ -6,6 +6,7 @@
 ;             Version C.1.2, November 2026
 ;               - Destruction is decided by NetComConnection.ReadyToDestroy? under the connection
 ;                 CritSect (re-check after TryEnter; a connection not closed yet is closed first).
+;               - Protocol callbacks (handshake/pause timeout) run without the pool lock.
 ;             Version C.1.1, November 2026
 ;               - Accepted (server) connections are supervised, only pending acceptors are skipped.
 ;               - TLS handshake timeout (dHandshakeTimeout) for the initial handshake.
@@ -177,12 +178,21 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
                       ;Handshake deadline expired => notify the protocol and abort the connection.
                       ;Protocol callbacks may not preserve xbx/xsi => reload them afterwards.
                       mov pConn, xbx
+                      ;No protocol code under the pool lock: a callback waiting for another
+                      ;connection would block every worker that needs the pool. The connection
+                      ;stays locked, and only the supervisor destroys connections, so it stays
+                      ;valid and linked in the chain meanwhile.
+                      mov xcx, [xsi].pOwner
+                      invoke LeaveCriticalSection, addr [xcx].$Obj(NetComEngine).ConnectionPool.CritSect
+                      mov xbx, pConn
                       OCall [xbx].$Obj(NetComConnection).pProtocol::NetComProtocol.OnHandshakeFailed, \
                             xbx, TLS_HANDSHAKE_TIMEOUT
                       mov xbx, pConn
                       OCall [xbx].$Obj(NetComConnection).pProtocol::NetComProtocol.OnError, \
                             xbx, NULL, TLS_HANDSHAKE_TIMEOUT
                       SetObject xsi
+                      mov xcx, [xsi].pOwner
+                      invoke EnterCriticalSection, addr [xcx].$Obj(NetComEngine).ConnectionPool.CritSect
                       mov xbx, pConn
                       OCall xbx::NetComConnection.QueueDestroy
                       OCall xbx::NetComConnection.Close, TRUE
@@ -211,9 +221,15 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
               .if SDWORD ptr edx >= 0
                 ;Protocol callbacks may not preserve xbx/xsi => reload them afterwards
                 mov pConn, xbx
+                ;No protocol code under the pool lock (see the handshake timeout above)
+                mov xcx, [xsi].pOwner
+                invoke LeaveCriticalSection, addr [xcx].$Obj(NetComEngine).ConnectionPool.CritSect
+                mov xbx, pConn
                 OCall [xbx].$Obj(NetComConnection).pProtocol::NetComProtocol.OnError, \
                       xbx, NULL, NCCN_RCV_PAUSE_TIMEOUT
                 SetObject xsi
+                mov xcx, [xsi].pOwner
+                invoke EnterCriticalSection, addr [xcx].$Obj(NetComEngine).ConnectionPool.CritSect
                 mov xbx, pConn
                 OCall xbx::NetComConnection.QueueDestroy
                 OCall xbx::NetComConnection.Close, TRUE
