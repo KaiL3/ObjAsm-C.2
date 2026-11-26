@@ -80,7 +80,6 @@ ObjectEnd
 
 
 include SRPS_Protocol.inc
-include SRPS_Supervisor.inc
 include SRPS_About.inc
 
 TIMER_ID  equ   126985
@@ -340,7 +339,7 @@ Method Application.CtlsGet, uses xdi xbx xsi
     xor eax, eax
     ExitMethod
   .endif
-  lea xbx, $ObjTmpl(NetComSrpsSupervisor)
+  lea xbx, $ObjTmpl(NetComSupervisor)
   mov ecx, 10000000                                     ;Convert into 100ns units
   imul ecx
   mov [xbx].$Obj(NetComSupervisor).dInactivityTimeout, eax
@@ -495,7 +494,7 @@ Method Application.CtlsSet, uses xbx xdi xsi
   invoke SendMessage, xdi, UDM_SETPOS32, 0, dPort
 
   ;Set timeout edit control
-  lea xbx, $ObjTmpl(NetComSrpsSupervisor)
+  lea xbx, $ObjTmpl(NetComSupervisor)
   mov eax, [xbx].$Obj(NetComSupervisor).dInactivityTimeout
   cdiv 10000000
   mov dTimeout, edx
@@ -556,7 +555,7 @@ Method Application.Init, uses xbx xsi
       invoke ExitProcess, 1                               ;Exit program with failure
     .endif
   .endif
-  OCall [xsi].RevProxy::NetComEngine.Init, xsi, offset $ObjTmpl(NetComSrpsSupervisor), \
+  OCall [xsi].RevProxy::NetComEngine.Init, xsi, offset $ObjTmpl(NetComSupervisor), \
                                            50, 1000, SRPS_IOJOB_BUFFER_SIZE ;Init network engine
   .if eax != 0
     invoke MessageBox, [xsi].hWnd, $OfsCStr("Failed to start the NetCom engine"), \
