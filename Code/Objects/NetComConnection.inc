@@ -1,9 +1,13 @@
 ; ==================================================================================================
 ; Title:      NetComConnection.inc
 ; Author:     G. Friedrich
-; Version:    C.1.3
+; Version:    C.1.4
 ; Purpose:    ObjAsm support of NetComConnection objects.
-; Notes:      Version C.1.3, November 2026
+; Notes:      Version C.1.4, November 2026
+;               - OnReceived: a FIN without close_notify on a TLS connection is reported as
+;                 TLS_TRUNCATED (OnDisconnected dResult); during the initial handshake also as a
+;                 failed handshake (OnHandshakeFailed, OnError), and the connection is closed.
+;             Version C.1.3, November 2026
 ;               - Close, Disconnect and QueueDestroy take the connection CritSect: they are called
 ;                 from application threads and the engine, concurrent calls posted the
 ;                 OnDisconnected/OnClosed completions twice (use after free).
@@ -798,14 +802,16 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
     SDLL_Remove xax, xcx, xdx
     OCall [xbx].$Obj(NetComConnectionPool).pIOJobPool::NetComIOJobPool.FreeItem, pIOJob
 
-    ; TLS Shutdown Pending: Peer hat TCP FIN statt close_notify geschickt
+    ;We sent close_notify (Disconnect) and the peer answered with a FIN instead of its own
+    ;close_notify. Not reported as truncation: we initiated the close, and data received after
+    ;our close_notify is discarded anyway (TLS_STATE_SHUTDOWN).
     .ifBitSet [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
       BitClr [xsi].dFlags, NCC_TLS_SHUTDOWN_PENDING
       BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
       .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
         BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
         mov [xsi].dDisconnectError, NO_ERROR
-        mov [xsi].dDisconnectDirection, SD_SEND          ;Wir haben initiiert
+        mov [xsi].dDisconnectDirection, SD_SEND          ;We initiated it
         mov xcx, [xsi].pOwner                           ;xcx -> NetComConnectionPool
         mov xax, [xcx].$Obj(NetComConnectionPool).pOwner ;xax -> NetComEngine
         invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
@@ -813,25 +819,39 @@ Method NetComConnection.OnReceived, uses xbx xdi xsi, pIOJob:PIOJOB
       .endif
 
     .elseif [xsi].pTLSContext != NULL
-      ; TLS Responder-Pfad: FIN kam nach close_notify-Verarbeitung.
-      ; Wir haben bereits unsere close_notify-Antwort gesendet (NCC_SHUTDOWN_SND_LOCAL).
-      ; Kein weiterer Disconnect ntig  Socket wird ber QueueDestroy abgebaut.
       .ifBitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
-        ; Shutdown-Sequenz bereits komplett  nichts weiter tun
+        ;Our send side is already shut down (close_notify answered in OnReceivedTLS, or a local
+        ;Disconnect): this FIN completes the shutdown sequence, nothing more to do.
       .else
-        ; FIN ohne vorherige close_notify (truncated close)  sauber beenden
+        ;FIN without close_notify: the peer ended the TLS stream without its authenticated end
+        ;marker. Data can be missing (truncation attack, or a peer that skips close_notify), a
+        ;partial record in the reassembly buffer is dropped. Shut down our side as well.
         .ifBitClr [xsi].dFlags, NCC_CLOSED
           invoke shutdown, [xsi].hSocket, SD_SEND
           BitSet [xsi].dFlags, NCC_SHUTDOWN_SND_LOCAL
         .endif
+        ;Reported only if this FIN is the first sign of the end (no Close/Disconnect before)
         .ifBitClr [xsi].dFlags, NCC_DISCONNECT_POSTED
           BitSet [xsi].dFlags, NCC_DISCONNECT_POSTED
-          mov [xsi].dDisconnectError, NO_ERROR
+          mov [xsi].dDisconnectError, TLS_TRUNCATED       ;OnDisconnected dResult
           mov [xsi].dDisconnectDirection, SD_RECEIVE
-          mov xcx, [xsi].pOwner
-          mov xax, [xcx].$Obj(NetComConnectionPool).pOwner
+          mov xcx, [xsi].pOwner                         ;xcx -> NetComConnectionPool
+          mov xax, [xcx].$Obj(NetComConnectionPool).pOwner  ;xax -> NetComEngine
           invoke PostQueuedCompletionStatus, [xax].$Obj(NetComEngine).hIOCP, \
                  0, COMPLETION_KEY_DISCONNECTED, xsi
+
+          ;FIN during the initial handshake: the handshake failed. DISCONNECTED is already
+          ;posted, so a Close in the callbacks cannot replace its result.
+          mov xcx, [xsi].pTLSContext
+          .if [xcx].$Obj(TLS_Context).bHandshakeDone == FALSE
+            OCall [xsi].pTLSContext::TLS_Context.GetState
+            .if eax == TLS_STATE_NONE || eax == TLS_STATE_HANDSHAKE
+              OCall [xsi].pProtocol::NetComProtocol.OnHandshakeFailed, xsi, TLS_TRUNCATED
+              OCall [xsi].pProtocol::NetComProtocol.OnError, xsi, NULL, TLS_TRUNCATED
+              OCall xsi.QueueDestroy                    ;No application data to keep
+              OCall xsi.Close, FALSE
+            .endif
+          .endif
         .endif
       .endif
 

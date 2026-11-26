@@ -1,7 +1,7 @@
 ; ==================================================================================================
 ; Title:      TLS_TestCommon.inc
 ; Author:     Kai Liebenau
-; Version:    1.1.0
+; Version:    1.1.1
 ; Purpose:    Shared code of the NetCom TLS test server and client:
 ;               - settings (defaults, INI file next to the executable),
 ;               - TLS configuration snapshots (TLS_Connection_Config + certificate provider),
@@ -9,6 +9,8 @@
 ;               - statistics, message scanning and connection test actions.
 ; Notes:      The including .asm file must define TLS_TEST_ROLE (TLS_TEST_ROLE_SERVER or
 ;             TLS_TEST_ROLE_CLIENT) before including this file.
+;             Version 1.1.1, November 2026
+;               - Statistics: disconnects without close_notify (TLS_TRUNCATED).
 ;             Version 1.1.0, November 2026
 ;               - Initial release.
 ; ==================================================================================================
@@ -77,6 +79,7 @@ TLS_TEST_STATS struct
   dLastError        DWORD   ?
   dMessages         DWORD   ?
   dEchoDropped      DWORD   ?
+  dTruncated        DWORD   ?                           ;Disconnects with TLS_TRUNCATED
 TLS_TEST_STATS ends
 
 ;Search data owned by a certificate provider. TLS_CertProvider stores only pointers, so the
@@ -1024,8 +1027,9 @@ TestPrintStats proc uses xbx xdi, hDC:HDC, dXPos:DWORD, dYPos:DWORD, dPaused:DWO
   invoke TextOut, hDC, dXPos, ebx, xdi, eax
   add ebx, 20
 
-  invoke wsprintf, xdi, $OfsCStr("#Errors = %lu, last = %lu (0x%08X)          "), \
-                   TestStats.dErrors, TestStats.dLastError, TestStats.dLastError
+  invoke wsprintf, xdi, $OfsCStr("#Errors = %lu, last = %lu (0x%08X), truncated = %lu          "), \
+                   TestStats.dErrors, TestStats.dLastError, TestStats.dLastError, \
+                   TestStats.dTruncated
   invoke StrLength, xdi
   invoke TextOut, hDC, dXPos, ebx, xdi, eax
   add ebx, 20

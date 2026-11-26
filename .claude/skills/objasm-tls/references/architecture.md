@@ -101,8 +101,12 @@ Tokens (`SendToken`) go through `QueueSendRaw`, which stops early when `NCC_SND_
   `NetComSupervisor` closes abortively after `dTLSShutdownTimeout`.
 - **Peer** close_notify (`SEC_I_CONTEXT_EXPIRED`): reply with our close_notify unless the peer already
   sent FIN, then `shutdown(SD_SEND)` + DISCONNECTED(SD_RECEIVE).
-- **FIN without close_notify** (truncation): `shutdown(SD_SEND)` + DISCONNECTED; with
-  `NCC_SHUTDOWN_SND_LOCAL` set the sequence is already complete.
+- **FIN without close_notify** (truncation): `shutdown(SD_SEND)` + DISCONNECTED with
+  `dDisconnectError = TLS_TRUNCATED` (OnDisconnected `dResult`), only if nothing was posted before.
+  During the initial handshake (`bHandshakeDone == FALSE`, state NONE/HANDSHAKE) additionally
+  `OnHandshakeFailed` + `OnError(NULL)` with TLS_TRUNCATED and QueueDestroy + Close. With
+  `NCC_SHUTDOWN_SND_LOCAL` set the sequence is already complete; after our own close_notify
+  (`NCC_TLS_SHUTDOWN_PENDING`) a FIN answer is NO_ERROR (data is discarded in SHUTDOWN anyway).
 - `OnError` suppresses expected errors after `NCC_CLOSED` or after a TLS half-close.
 - `DISCONNECTED` / `CLOSED` are posted as synthetic IOCP completions exactly once
   (`NCC_DISCONNECT_POSTED`, `..._DELIVERED` flags gate destruction).

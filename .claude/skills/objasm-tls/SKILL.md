@@ -92,6 +92,9 @@ NetCom does **not** create or free TLS contexts. In the protocol object:
 - Read received plaintext from **`[pConn].PlaintextChain`**, not `RcvIOJobChain` (that one holds
   ciphertext on TLS connections). Existing sample protocols scan `RcvIOJobChain` - they are not
   TLS-ready as they are.
+- `OnDisconnected(pConn, dDirection, dResult)`: `dResult == TLS_TRUNCATED` means the peer closed
+  with a FIN but without close_notify. A protocol that takes the connection end as end of message
+  (HTTP/1.0 body, streams without length) must treat the last message as incomplete then.
 - `Release(pConn)`: `Destroy [pConn].pTLSContext` and clear the pointer.
 - Run the engine **with a `NetComSupervisor`**: TLS shutdown timeout, TLS handshake timeout
   (`dHandshakeTimeout`, initial handshake only, counted from StartTime) and inactivity timeout live
@@ -157,7 +160,8 @@ The script assembles (no lib, nothing in the repo is touched) every TLS/NetCom o
 
 Assembling proves syntax and macro expansion only. Behaviour needs a running client/server.
 Ready-made runtime tests are in **`scripts/nettest/`** (see its README): pipelined load with resets
-against the Core Test and TLS Test servers, shutdown under load, a garbage TLS record, and SRPS with
+against the Core Test and TLS Test servers, shutdown under load, a garbage TLS record, truncation
+(FIN without close_notify, needs a `DEBUG(LOG)` build of the TLS Test server), and SRPS with
 bidirectional TLS clients, slow readers, shutdown and inactivity timeout, plus a deadlock check via
 Wait Chain Traversal. Use release builds (no `DEBUG(WND)`) and moderate load. Beyond that, test
 against `openssl s_server`/`s_client` or `curl -v --resolve host:port:127.0.0.1`, including SNI with
@@ -173,4 +177,10 @@ Server 2022 (Windows 10 SChannel does not negotiate TLS 1.3).
   SEC_E_ALGORITHM_MISMATCH (protocol/cipher), `80090325` untrusted root, `800B010F` CN mismatch,
   `800B0109` untrusted root (validator), `80090327` cert unknown, `00090320`
   SEC_I_INCOMPLETE_CREDENTIALS (server wants client cert), `00090321` SEC_I_RENEGOTIATE,
-  `00090317` SEC_I_CONTEXT_EXPIRED (peer close_notify).
+  `00090317` SEC_I_CONTEXT_EXPIRED (peer close_notify). Own codes (AddErrMsg, values shift if
+  entries are inserted): `111111142` TLS_HANDSHAKE_TIMEOUT, `111111143` (`069F6BE7h`)
+  TLS_TRUNCATED = peer FIN without close_notify (OnDisconnected `dResult`; during the handshake
+  also OnHandshakeFailed/OnError). Many peers (e.g. .NET SslStream without ShutdownAsync) skip
+  close_notify, so TLS_TRUNCATED is normal for them; it matters for protocols framed by the close.
+- `SysSetup ..., DEBUG(LOG)` writes the Dbg output to `<SRC>.dbg` in the working directory, but
+  only when the program exits; scripts can parse it (see `scripts/nettest/truncationtest.ps1`).

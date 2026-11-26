@@ -1,13 +1,15 @@
 ; ==================================================================================================
 ; Title:      TLS_Context.inc
 ; Author:     Kai Liebenau
-; Version:    C.2.1
+; Version:    C.2.2
 ; Purpose:    ObjAsm TLS/SSL encryption support for the NetCom framework.
 ;             Defines TLS state constants, search type constants, error codes, and the abstract
 ;             TLS_Context base class used by NetComConnection for polymorphic TLS operations.
 ; Links:      - https://learn.microsoft.com/en-us/windows/win32/secauthn/schannel
 ;             - https://learn.microsoft.com/en-us/windows/win32/secauthn/creating-an-schannel-security-context
 ; Notes:      This file requires the NetCom framework objects to be loaded.
+;             Version C.2.2
+;               - New error code TLS_TRUNCATED (peer FIN without close_notify).
 ;             Version C.2.1
 ;               - bHandshakeDone moved here from TLS_SChannelContext (NetComSupervisor handshake
 ;                 timeout), new error code TLS_HANDSHAKE_TIMEOUT.
@@ -54,6 +56,7 @@ AddErrMsg TLS_SERVER_CERT_NO_PRIVATE_KEY, "Server-Zertifikat ohne privaten Schlu
 AddErrMsg TLS_BUFFER_ALLOC_FAILED,        "TLS-Puffer-Allokation fehlgeschlagen"
 AddErrMsg TLS_CONFIG_DURING_HANDSHAKE,    "TLS-Konfigurationsaenderung waehrend aktivem Handshake nicht erlaubt"
 AddErrMsg TLS_HANDSHAKE_TIMEOUT,          "TLS handshake timeout"
+AddErrMsg TLS_TRUNCATED,                  "TLS connection ended by the peer without close_notify"
 
 
 ; ==================================================================================================

@@ -210,7 +210,10 @@ MethodEnd
 Method NetComTLSClientProtocol.OnDisconnected, uses xbx xsi, pConnection:$ObjPtr(NetComConnection), \
                                                              dDirection:DWORD, dResult:DWORD
   SetObject xsi
-  DbgText "NetComTLSClientProtocol.OnDisconnected", "&PROTOCOL_WND_NAME"
+  DbgHex dResult, "NetComTLSClientProtocol.OnDisconnected", "&PROTOCOL_WND_NAME"
+  .if dResult == TLS_TRUNCATED                          ;Server closed without close_notify
+    lock inc TestStats.dTruncated
+  .endif
   mov xbx, [xsi].pOwner
   ;Post to UI thread ù enable controls (connection is logically gone)
   invoke PostMessage, [xbx].$Obj(NetComTLSClient).SndDlg.hWnd, WM_NETCOM_ENABLE_CTRLS, TRUE, 0

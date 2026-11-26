@@ -1,9 +1,11 @@
 ; ==================================================================================================
 ; Title:      NetComProtocol.inc
 ; Author:     G. Friedrich
-; Version:    C.1.2
+; Version:    C.1.3
 ; Purpose:    ObjAsm support of NetComProtocol objects.
-; Notes:      Version C.1.2, November 2026
+; Notes:      Version C.1.3, November 2026
+;               - OnDisconnected / OnHandshakeFailed: TLS_TRUNCATED documented.
+;             Version C.1.2, November 2026
 ;               - IsDataComplete?: which IOJobs of the receive chains hold valid data.
 ;               - OnError: NULL arguments documented.
 ;               - OnSendQueueLow: new (send queue drained after reaching the high-water mark).
@@ -185,7 +187,11 @@ MethodEnd
 ; Purpose:    An established connection has been disconnected.
 ; Arguments:  Arg1: -> NetComConnection.
 ;             Arg2: Disconnect direction = SD_RECEIVE(0)/SD_SEND(1)/SD_BOTH(2)
-;             Arg3: Operation result.
+;             Arg3: Operation result: NO_ERROR, the error of a failed shutdown, or TLS_TRUNCATED:
+;                   the peer ended a TLS connection with a FIN but without close_notify. Data it
+;                   sent last can be missing. A protocol that frames messages by the end of the
+;                   connection must treat this as an error. Many peers skip close_notify, so it
+;                   is not necessarily an attack.
 ; Return:     Nothing.
 
 Method NetComProtocol.OnDisconnected,, pConnection:$ObjPtr(NetComConnection), \
@@ -275,7 +281,9 @@ MethodEnd
 ; Method:     NetComProtocol.OnHandshakeFailed
 ; Purpose:    TLS handshake failed. Override in derived classes to handle the event.
 ; Arguments:  Arg1: -> NetComConnection.
-;             Arg2: Error code.
+;             Arg2: Error code: SECURITY_STATUS of the failed SSPI call or a TLS_xxx code, e.g.
+;                   TLS_HANDSHAKE_TIMEOUT, or TLS_TRUNCATED when the peer closed the connection
+;                   during the handshake (FIN).
 ; Return:     Nothing.
 
 Method NetComProtocol.OnHandshakeFailed,, pConnection:$ObjPtr(NetComConnection), dError:DWORD

@@ -194,13 +194,16 @@ MethodEnd
 ; Purpose:    An established connection has been disconnected.
 ; Arguments:  Arg1: -> NetComConnection.
 ;             Arg2: Disconnect direction.
-;             Arg3: Operation result.
+;             Arg3: Operation result. TLS_TRUNCATED = the client closed without close_notify.
 ; Return:     Nothing.
 
 Method NetComTLSServerProtocol.OnDisconnected, uses xbx xsi, pConnection:$ObjPtr(NetComConnection), \
                                                     dDirection:DWORD, dResult:DWORD
   SetObject xsi
-  DbgText "NetComTLSServerProtocol.OnDisconnected", "&PROTOCOL_WND_NAME"
+  DbgHex dResult, "NetComTLSServerProtocol.OnDisconnected", "&PROTOCOL_WND_NAME"
+  .if dResult == TLS_TRUNCATED
+    lock inc TestStats.dTruncated
+  .endif
   ACall xsi.OnDisconnected, pConnection, dDirection, dResult
 MethodEnd
 

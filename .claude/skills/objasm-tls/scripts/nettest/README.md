@@ -1,8 +1,8 @@
 # NetCom / TLS / SRPS runtime tests
 
 PowerShell scripts that drive the NetCom sample programs from outside (no GUI interaction needed).
-They were written during the NetCom control-flow review (2026-11-26, findings O23-O35 in
-`../../references/known-issues.md`).
+They were written during the NetCom control-flow review (2026-11-26, findings O15, O17 and O23-O36
+in `../../references/known-issues.md`).
 
 Run every script in a fresh process, e.g. `powershell -NoProfile -ExecutionPolicy Bypass -File srpstest.ps1`,
 so `Add-Type` never meets an older compiled `SrpsProbe.cs` in the same session.
@@ -27,6 +27,7 @@ so `Add-Type` never meets an older compiled `SrpsProbe.cs` in the same session.
 | `nettest.ps1 -Mode plain\|tls -Port n` | running Core Test server (plain) or TLS Test server (tls) | A: 10,000 pipelined ZTC messages (15 MB) on one connection (TLS: echo read back completely); B: 8 interleaved connections; C: 200 connections reset with RST in the middle of a message; D: liveness check |
 | `shutdowntest.ps1 -Exe path -Mode plain\|tls -Port n` | starts the server itself | 20 open connections plus a client connecting in a loop, then WM_CLOSE: the server must exit within seconds with exit code 0 |
 | `garbagetest.ps1 -Port 25774` | running TLS Test server | TLS handshake + echo, then a garbage TLS record on the raw stream: the server must reset the connection at once (decrypt error path) |
+| `truncationtest.ps1 [-KeepLog]` | starts the TLS Test server, **built with `DEBUG(LOG)`** | FIN without close_notify (O15): close_notify + FIN, FIN after data, FIN inside a record, FIN before / inside the ClientHello; checks OnDisconnected `dResult` / OnHandshakeFailed in `NETCOMTLSSERVER.dbg` (written when the server exits) |
 | `tlsbench.ps1` | starts the TLS Test server | `nettest.ps1 -Mode tls` with wall time and server CPU (user/kernel) |
 | `srpstest.ps1` | starts TLS Test server + SRPS, configures and starts SRPS through its dialog | bidirectional TLS clients through the proxy, see below |
 | `stressclienttest.ps1` | starts Stress Test server + client, drives the client's send dialog | connection lifetime vs. application threads (O17): server killed while the client streams, Disconnect on the destroyed connection, regular cycle, exit (answers the exit prompt); prints windows and wait chains if the exit hangs |
@@ -60,4 +61,5 @@ analysis). It can be reused for other targets.
 | SRPS Stop + close while streaming | exit code 0 after 0.5-0.6 s |
 | Core / TLS server shutdown with 20 connections + connect loop | exit code 0 after 0.6 s |
 | TLS garbage record | connection reset after 0.02-0.04 s |
+| TLS truncation (6 cases) | all pass: clean close 0, every FIN without close_notify TLS_TRUNCATED, in the handshake also OnHandshakeFailed |
 | SRPS inactivity timeout 3 s / 5 s | idle connection closed after 3.23 s / 5.14 s |
