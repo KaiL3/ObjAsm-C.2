@@ -22,6 +22,9 @@
 ;                 CreateConnection (new, NewConnection uses it) can create a connection sharing the
 ;                 CritSect of another one; LeaveConnection also destroys a lock owner that only
 ;                 waited for the destroyed partner (no supervisor).
+;               - AcquireConnection/ReleaseConnection: new, safe use of a connection pointer kept
+;                 by an application thread; ConnectTo returns the connection ID in edx; the
+;                 destroy paths clear the ID under the pool lock before the CritSect is released.
 ;               - WorkerJob: a failed send/receive completion decrements dSndQueuedIOJobs /
 ;                 dRcvQueuedIOJobs (they stayed high), the send queue check follows.
 ;             Version C.1.1, November 2026
@@ -127,6 +130,74 @@ MethodEnd
 ; ==================================================================================================
 
 ; --------------------------------------------------------------------------------------------------
+; Method:     NetComEngine.AcquireConnection
+; Purpose:    Validates a connection pointer kept by an application thread and enters the
+;             connection CritSect. The engine destroys connections at any time (peer close,
+;             errors, timeouts) and reuses their memory, so outside the protocol callbacks a
+;             stored pointer must only be used between AcquireConnection and ReleaseConnection.
+; Arguments:  Arg1: -> NetComConnection (may be stale).
+;             Arg2: Its connection ID (NetComConnection.dConnectionId, returned by ConnectTo in edx
+;                   or read in a protocol callback).
+; Return:     eax = TRUE: the connection still exists and its CritSect is held by the caller (call
+;                   ReleaseConnection when done). FALSE: it is gone (destroyed or slot reused).
+; Note:       - The pointer is first looked up in the connection chain: the pool releases memory
+;               blocks that became empty, so a stale pointer must not be dereferenced before.
+;             - Do not call it while holding the CritSect of another connection (it may wait).
+
+Method NetComEngine.AcquireConnection, uses xbx xdi xsi, pConnection:POINTER, dConnectionId:DWORD
+  local dResult:DWORD
+
+  SetObject xsi
+  .while TRUE
+    mov dResult, FALSE
+    invoke EnterCriticalSection, addr [xsi].ConnectionPool.CritSect
+    mov xax, pConnection
+    .if xax != NULL && dConnectionId != 0
+      ;Still linked? Only then its memory is valid. The pool lock keeps it linked meanwhile.
+      lea xcx, [xax + offset $Obj(NetComConnection).ChainItem]
+      lea xdi, [xsi].ConnectionChain                    ;xdi -> SENTINEL
+      mov xbx, [xdi].SDLL_SENTINEL.pFirstItem
+      .while xbx != xdi
+        .break .if xbx == xcx
+        mov xbx, [xbx].SDLL_ITEM.pNextItem
+      .endw
+      .if xbx != xdi
+        ;Same connection (not a reused slot) and initialized?
+        mov xbx, pConnection
+        mov eax, dConnectionId
+        .if eax == [xbx].$Obj(NetComConnection).dConnectionId
+          .if [xbx].$Obj(NetComConnection).pCritSect != NULL
+            ;Never wait for a connection while holding the pool lock (lock order)
+            invoke TryEnterCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
+            .if eax != FALSE
+              mov dResult, TRUE
+            .else
+              mov dResult, -1                           ;Busy => validate again
+            .endif
+          .endif
+        .endif
+      .endif
+    .endif
+    invoke LeaveCriticalSection, addr [xsi].ConnectionPool.CritSect
+    .break .if dResult != -1
+    invoke Sleep, 0                                     ;Let the current owner finish
+  .endw
+  mov eax, dResult
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
+; Method:     NetComEngine.ReleaseConnection
+; Purpose:    Leaves the CritSect entered by AcquireConnection. The pointer must not be used
+;             afterwards without acquiring it again.
+; Arguments:  Arg1: -> NetComConnection.
+; Return:     Nothing.
+
+Method NetComEngine.ReleaseConnection,, pConnection:POINTER
+  mov xax, pConnection
+  invoke LeaveCriticalSection, [xax].$Obj(NetComConnection).pCritSect
+MethodEnd
+
+; --------------------------------------------------------------------------------------------------
 ; Method:     NetComEngine.ConnectionsApply
 ; Purpose:    Applies an action to all connections.
 ;             A worker can hold a connection CritSect and wait for the pool lock (OnAccepted ->
@@ -224,24 +295,34 @@ MethodEnd
 ;             Arg2: -> Remote address.
 ;             Arg2: -> Local address.
 ; Return:     xax -> New NetComConnection or NULL if failed.
+;             edx = Its connection ID (0 if failed). An application thread that keeps the pointer
+;                   must keep the ID with it and use the connection only through
+;                   AcquireConnection / ReleaseConnection: the engine may destroy it at any time.
 
 Method NetComEngine.ConnectTo, uses xbx xsi, pProtocol:$ObjPtr(NetComProtocol), \
                                              pRemoteAddr:PNETCOMADDR, pLocalAddr:PNETCOMADDR
+  local dConnectionId:DWORD
+
   SetObject xsi
+  mov dConnectionId, 0
   ;Get a new NetComConnection and (re)initialize it.
   ?mov xdx, pProtocol
   OCall xsi.NewConnection, xdx
   .if xax != NULL
     mov xbx, xax
+    ;Read the ID before any IO is queued: from then on the engine may destroy the connection
+    m2m dConnectionId, [xbx].$Obj(NetComConnection).dConnectionId, eax
     OCall xbx::NetComConnection.QueueConnect, pRemoteAddr, pLocalAddr
     .if eax != NO_ERROR
       ;If we have an error here, nothing was queued, so we can dispose our connection safely
       OCall xsi.DiscardConnection, xbx
+      mov dConnectionId, 0
       xor eax, eax
     .else
       mov xax, xbx                                        ;Return xax -> NetComConnection
     .endif
   .endif
+  mov edx, dConnectionId
 MethodEnd
 
 ; --------------------------------------------------------------------------------------------------
@@ -462,6 +543,15 @@ Method NetComEngine.LeaveConnection, uses xbx xdi xsi, pConnection:$ObjPtr(NetCo
           m2m pOwnerDone, pLockOwner, xax
         .endif
       .endif
+      ;Clear the IDs under the pool lock before the CritSect is released: AcquireConnection
+      ;(application threads) validates under the pool lock and must not get these any more
+      invoke EnterCriticalSection, addr [xsi].ConnectionPool.CritSect
+      mov [xbx].$Obj(NetComConnection).dConnectionId, 0
+      mov xax, pOwnerDone
+      .if xax != NULL
+        mov [xax].$Obj(NetComConnection).dConnectionId, 0
+      .endif
+      invoke LeaveCriticalSection, addr [xsi].ConnectionPool.CritSect
       invoke LeaveCriticalSection, xdi
       OCall xbx::NetComConnection.Done                  ;Own CritSect of the partner
       OCall [xsi].ConnectionPool::NetComConnectionPool.FreeItem, xbx

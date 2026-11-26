@@ -39,6 +39,7 @@ Object SendDlg,, DialogModal
 
   DefineVariable    ServerAddr,     NETCOMADDR, {}      ;Remote server network address
   DefineVariable    pConnection,    $ObjPtr(NetComConnection),  NULL ;-> NetComConnection
+  DefineVariable    dConnectionId,  DWORD,      0   ;Its ID (NetComEngine.AcquireConnection)
   DefineVariable    dFlags,         DWORD,      SDF_CTRLS_ENABLED or SDF_STOP   ;Dialog flags
   DefineVariable    dFrameCount,    DWORD,      0
   DefineVariable    hWorker,        HANDLE,     0
@@ -564,6 +565,7 @@ Method SendDlg.OnCommand, uses xdi xsi, wParam:WPARAM, lParam:LPARAM
                                         offset $ObjTmpl(NetComStressClientProtocol).ServerRemoteAddr, \
                                         offset $ObjTmpl(NetComStressClientProtocol).ClientLocalAddr
       mov [xsi].pConnection, xax                        ;Store connection
+      mov [xsi].dConnectionId, edx                      ;...and its ID (AcquireConnection)
       mov [xsi].hWorker, $invoke(CreateThread, NULL, 0, $MethodAddr(SendDlg.Worker), xsi, 0, NULL)
       OCall xsi.CtlsEnable, FALSE                       ;Disable controls
     .endif
@@ -573,10 +575,18 @@ Method SendDlg.OnCommand, uses xdi xsi, wParam:WPARAM, lParam:LPARAM
     .if [xsi].pConnection != NULL
       BitSet [xsi].dFlags, SDF_STOP
       invoke WaitForSingleObject, [xsi].hWorker, 4000   ;Stop sending
-      OCall [xsi].pConnection::NetComConnection.Disconnect, SD_SEND
-      OCall [xsi].pConnection::NetComConnection.QueueDestroy   ;Free connection object
-      OCall [xsi].pConnection::NetComConnection.Close, FALSE   ;Free connection object
+      ;The engine may have destroyed the connection already (error, peer close)
+      OCall [xdi].$Obj(NetComStressClient).Client::NetComEngine.AcquireConnection, \
+            [xsi].pConnection, [xsi].dConnectionId
+      .if eax != FALSE
+        OCall [xsi].pConnection::NetComConnection.Disconnect, SD_SEND
+        OCall [xsi].pConnection::NetComConnection.QueueDestroy   ;Free connection object
+        OCall [xsi].pConnection::NetComConnection.Close, FALSE   ;Free connection object
+        OCall [xdi].$Obj(NetComStressClient).Client::NetComEngine.ReleaseConnection, \
+              [xsi].pConnection
+      .endif
       mov [xsi].pConnection, NULL
+      mov [xsi].dConnectionId, 0
     .endif
     OCall xsi.CtlsEnable, TRUE                          ;Enable controls
     xor eax, eax                                        ;Handled
@@ -585,9 +595,16 @@ Method SendDlg.OnCommand, uses xdi xsi, wParam:WPARAM, lParam:LPARAM
     .if [xsi].pConnection != NULL
       BitSet [xsi].dFlags, SDF_STOP
       invoke WaitForSingleObject, [xsi].hWorker, 4000
-      OCall [xsi].pConnection::NetComConnection.QueueDestroy   ;Free connection object
-      OCall [xsi].pConnection::NetComConnection.Close, FALSE   ;Free connection object
+      OCall [xdi].$Obj(NetComStressClient).Client::NetComEngine.AcquireConnection, \
+            [xsi].pConnection, [xsi].dConnectionId
+      .if eax != FALSE
+        OCall [xsi].pConnection::NetComConnection.QueueDestroy   ;Free connection object
+        OCall [xsi].pConnection::NetComConnection.Close, FALSE   ;Free connection object
+        OCall [xdi].$Obj(NetComStressClient).Client::NetComEngine.ReleaseConnection, \
+              [xsi].pConnection
+      .endif
       mov [xsi].pConnection, NULL
+      mov [xsi].dConnectionId, 0
     .endif
     OCall xsi.DestroyDialog, wParam                     ;Close dialog
     xor eax, eax                                        ;Handled
@@ -630,7 +647,7 @@ MethodEnd
 
 Method SendDlg.Worker, uses xbx xdi xsi
   local hNewBmp:HBITMAP, hPrvBmp:HBITMAP, hScreenDC:HDC, hMemDC:HANDLE
-  local dSizeX:DWORD, dSizeY:DWORD, BMI:BITMAPINFO, pMem:POINTER, dMemSize:DWORD
+  local dSizeX:DWORD, dSizeY:DWORD, BMI:BITMAPINFO, pMem:POINTER, dMemSize:DWORD, dQueued:DWORD
 
   SetObject xsi                                         ;Bind object context
   mov xdi, [xsi].pConnection                            ;Get connection
@@ -670,9 +687,19 @@ Method SendDlg.Worker, uses xbx xdi xsi
         .ifBitSet [xsi].dFlags, SDF_STOP
           .break
         .endif
-        
+
+        ;The engine may destroy the connection at any time (error, peer close): use it only while
+        ;it is acquired. The screen capture below runs without holding it.
+        mov xcx, [xsi].pOwner
+        OCall [xcx].$Obj(NetComStressClient).Client::NetComEngine.AcquireConnection, \
+              xdi, [xsi].dConnectionId
+        .break .if eax == FALSE                         ;Connection is gone
+        m2m dQueued, [xdi].$Obj(NetComConnection).dSndQueuedIOJobs, eax
+        mov xcx, [xsi].pOwner
+        OCall [xcx].$Obj(NetComStressClient).Client::NetComEngine.ReleaseConnection, xdi
+
         ;Wait until no more IOJobs are on the wire
-        .if [xdi].$Obj(NetComConnection).dSndQueuedIOJobs != 0
+        .if dQueued != 0
           invoke Sleep, 100
           .continue
         .endif
@@ -684,7 +711,14 @@ Method SendDlg.Worker, uses xbx xdi xsi
         add xax, sizeof(DWORD) + sizeof(BMI)            ;Size of BYTE count and BMI header
         ;Retrieve bitmap bits
         invoke GetDIBits, hMemDC, hNewBmp, 0, BMI.bmiHeader.biHeight, xax, xbx, DIB_RGB_COLORS
+
+        mov xcx, [xsi].pOwner
+        OCall [xcx].$Obj(NetComStressClient).Client::NetComEngine.AcquireConnection, \
+              xdi, [xsi].dConnectionId
+        .break .if eax == FALSE                         ;Connection is gone
         OCall xdi::NetComConnection.QueueSend, pMem, dMemSize  ;Send image
+        mov xcx, [xsi].pOwner
+        OCall [xcx].$Obj(NetComStressClient).Client::NetComEngine.ReleaseConnection, xdi
       .endw
       MemFree pMem                                      ;Free memory
     .else

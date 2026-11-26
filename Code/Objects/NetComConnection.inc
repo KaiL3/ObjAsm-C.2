@@ -15,6 +15,7 @@
 ;               - ReadyToDestroy?: destruction check under the CritSect, closes the connection
 ;                 first if necessary (FreeRessources must not post completions).
 ;               - OnAccepted: no new acceptor on a closed listener.
+;               - dConnectionId: unique ID assigned in Init (NetComEngine.AcquireConnection).
 ;               - DoSndIOJob/OnSent/CheckSndQueueLow: Protocol.OnSendQueueLow once the send queue
 ;                 drained to dSndLowWtrMrk after it had reached dSndHighWtrMrk.
 ;               - All locking goes through pCritSect (own CritSect, or the lock owner's for a
@@ -296,6 +297,7 @@ Method NetComConnection.Done, uses xsi
   ;which is destroyed only after all partners (dLockUsers).
   invoke DeleteCriticalSection, addr [xsi].CritSect
   mov [xsi].pCritSect, NULL
+  mov [xsi].dConnectionId, 0
   BitSet [xsi].dFlags, NCC_DONE
   ACall xsi.Done
 MethodEnd
@@ -501,6 +503,17 @@ Method NetComConnection.Init, uses xsi, pOwner:POINTER, pProtocol:POINTER
     lea xax, [xsi].CritSect
   .endif
   mov [xsi].pCritSect, xax
+
+  ;Unique connection ID, never 0 and never reused while the engine runs. Application threads keep
+  ;it with the pointer, NetComEngine.AcquireConnection tells by it if the pool slot was reused.
+  mov xcx, [xsi].pOwner                                 ;xcx -> NetComConnectionPool
+  mov xcx, [xcx].$Obj(NetComConnectionPool).pOwner      ;xcx -> NetComEngine
+  .repeat
+    mov eax, 1
+    lock xadd [xcx].$Obj(NetComEngine).dNextConnectionId, eax
+    inc eax
+  .until eax != 0
+  mov [xsi].dConnectionId, eax
   m2m [xsi].pProtocol, pProtocol, xax
   lea xax, [xsi].RcvIOJobChain
   SDLL_Init xax

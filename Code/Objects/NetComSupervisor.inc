@@ -8,6 +8,7 @@
 ;                 CritSect (re-check after TryEnter; a connection not closed yet is closed first).
 ;               - Protocol callbacks (handshake/pause timeout) run without the pool lock.
 ;               - Connection CritSects through pCritSect; connections before Init are skipped.
+;               - The connection ID is cleared under the pool lock before destruction.
 ;             Version C.1.1, November 2026
 ;               - Accepted (server) connections are supervised, only pending acceptors are skipped.
 ;               - TLS handshake timeout (dHandshakeTimeout) for the initial handshake.
@@ -286,6 +287,7 @@ Method NetComSupervisor.WorkerJob, uses xbx xdi xsi
             invoke LeaveCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
             jmp @@Next
           .endif
+          mov [xbx].$Obj(NetComConnection).dConnectionId, 0   ;AcquireConnection fails from now on
           OCall xbx::NetComConnection.FreeRessources    ;Protocol data and IOJobs
           invoke LeaveCriticalSection, [xbx].$Obj(NetComConnection).pCritSect
           OCall xbx::NetComConnection.Done

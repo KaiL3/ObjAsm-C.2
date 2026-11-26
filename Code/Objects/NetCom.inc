@@ -62,6 +62,9 @@
 ;               - NetComConnection: the CritSect is used through pCritSect; NewPartner creates a
 ;                 connection that shares the CritSect of another one (e.g. both sides of a proxy
 ;                 pair: one thread at a time per pair, no lock cycles between them).
+;               - NetComConnection.dConnectionId, NetComEngine.AcquireConnection/ReleaseConnection:
+;                 application threads keep (pointer, ID) instead of a bare pointer and use the
+;                 connection only while it is acquired (validated and locked).
 ;               - NetComProtocol.OnSendQueueLow: called once when the send queue of a connection
 ;                 has drained to dSndLowWtrMrk after it had reached dSndHighWtrMrk (backpressure).
 ;             Version C.1.0, October 2017
@@ -524,6 +527,7 @@ Object NetComConnection, NetComConnectionID, Primer
   DefineVariable  pCritSect,          POINTER,          NULL  ;-> CritSect in use: own or lock owner's
   DefineVariable  pLockOwner,         POINTER,          NULL  ;Partner: connection owning the CritSect
   DefineVariable  dLockUsers,         DWORD,            0     ;Partners using the own CritSect
+  DefineVariable  dConnectionId,      DWORD,            0     ;Unique, 0 = destroyed (AcquireConnection)
   DefineVariable  wName,              CHRW,             28 dup(?) ;Used for DebugCenter Wnd Caption
 ObjectEnd
 
@@ -620,6 +624,8 @@ Object NetComEngine, NetComEngineID, Primer
   VirtualMethod   ConnectionsDestroy
   StaticMethod    ConnectionsApply,   DWORD                   ;NCE_APPLY_xxx
   StaticMethod    CreateConnection,   POINTER, POINTER        ;-> Protocol, -> lock owner or NULL
+  StaticMethod    AcquireConnection,  POINTER, DWORD          ;Application threads: validate + lock
+  StaticMethod    ReleaseConnection,  POINTER
   VirtualMethod   ConnectTo,          $ObjPtr(NetComProtocol), PNETCOMADDR, PNETCOMADDR
   StaticMethod    DiscardConnection,  $ObjPtr(NetComConnection)
   RedefineMethod  Done
@@ -643,6 +649,7 @@ Object NetComEngine, NetComEngineID, Primer
   DefineVariable  dRateIn,            DWORD,          0
   DefineVariable  dRateOut,           DWORD,          0
   DefineVariable  pLocalHostName,     PSTRING,        NULL
+  DefineVariable  dNextConnectionId,  DWORD,          0       ;Source of NetComConnection.dConnectionId
 
   Embed ConnectionPool, NetComConnectionPool            ;Pool of NetComConnections
   Embed IOJobPool,      NetComIOJobPool                 ;IOJob Pool

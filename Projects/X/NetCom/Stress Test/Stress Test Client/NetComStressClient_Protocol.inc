@@ -67,16 +67,14 @@ Method NetComStressClientProtocol.OnError, uses xbx xdi xsi, pConnection:$ObjPtr
   SetObject xsi
   mov xbx, [xsi].pOwner
   .ifBitClr [xbx].$Obj(NetComStressClient).SndDlg.dFlags, SDF_ERROR
+    ;The send thread stops by itself (SDF_STOP, or AcquireConnection fails once the connection
+    ;is gone). Waiting for it here could block it: it may wait for the CritSect of this
+    ;connection, which this worker holds.
     BitSet [xbx].$Obj(NetComStressClient).SndDlg.dFlags, SDF_STOP or SDF_ERROR
-    invoke WaitForSingleObject, [xbx].$Obj(NetComStressClient).SndDlg.hWorker, 4000   ;Stop sending
-    OCall [xbx].$Obj(NetComStressClient).SndDlg.pConnection::NetComConnection.Disconnect, SD_SEND
-    OCall [xbx].$Obj(NetComStressClient).SndDlg.pConnection::NetComConnection.QueueDestroy
-    OCall [xbx].$Obj(NetComStressClient).SndDlg.pConnection::NetComConnection.Close, FALSE
-    mov [xbx].$Obj(NetComStressClient).SndDlg.pConnection, NULL
     OCall [xbx].$Obj(NetComStressClient).SndDlg::SendDlg.CtlsEnable, TRUE     ;Enable controls
   .endif
   ;ACall xsi.OnError, pConnection, pIOSockJob, dError
-  mov eax, PROT_CMD_NONE
+  mov eax, PROT_CMD_DESTROY                             ;Abort the failed connection
 MethodEnd
 
 endif
